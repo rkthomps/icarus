@@ -10,11 +10,11 @@ use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{alpha1, alphanumeric1, hex_digit1, multispace0};
 //use nom::character::complete::char;
+use nom::Err as ParseErr;
 use nom::combinator::{complete, map, opt, recognize, value};
 use nom::error::{ErrorKind as ParseErrorKind, ParseError as ParseErrorTrait};
-use nom::multi::{many0, many0_count, many_till, separated_list0};
+use nom::multi::{many_till, many0, many0_count, separated_list0};
 use nom::sequence::{delimited, pair, preceded, terminated};
-use nom::Err as ParseErr;
 //use nom::InputTakeAtPosition;
 use strum::IntoEnumIterator;
 
@@ -30,7 +30,8 @@ pub fn parse(input: &str) -> Result<Stub, ParseError> {
 
 type ParseError<'a> = nom::error::VerboseError<&'a str>;
 type ParseResult<'a, O> = nom::IResult<&'a str, O, ParseError<'a>>;
-trait Parser<'a, O> = nom::Parser<&'a str, O, ParseError<'a>>;
+trait Parser<'a, O>: nom::Parser<&'a str, O, ParseError<'a>> {}
+impl<'a, O, T> Parser<'a, O> for T where T: nom::Parser<&'a str, O, ParseError<'a>> {}
 
 fn parse_stub(input: &str) -> ParseResult<Stub> {
     let (input, kind) = parse_ident(input)?;
@@ -292,7 +293,13 @@ fn parse_base_shape_tagged_proto_fact(input: &str) -> ParseResult<BaseShapeTagge
     let (input, _) = symbol("BaseShapeTaggedProto")(input)?;
     let (input, base_shape) = terminated(addr, comma)(input)?;
     let (input, tagged_proto) = addr(input)?;
-    Ok((input, BaseShapeTaggedProtoFact { base_shape, tagged_proto }))
+    Ok((
+        input,
+        BaseShapeTaggedProtoFact {
+            base_shape,
+            tagged_proto,
+        },
+    ))
 }
 
 fn parse_class_is_native_object_fact(input: &str) -> ParseResult<ClassIsNativeObjectFact> {

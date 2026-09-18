@@ -229,7 +229,7 @@ impl ItemBuckets {
 
 impl IntoIterator for ItemBuckets {
     type Item = Item;
-    type IntoIter = impl Iterator<Item = Self::Item>;
+    type IntoIter = std::vec::IntoIter<Item>;
 
     fn into_iter(self) -> Self::IntoIter {
         let ItemBuckets {
@@ -253,6 +253,8 @@ impl IntoIterator for ItemBuckets {
             ..ir_item_buckets.into_iter().flatten(),
             ..top_level_items
         ]
+        .collect::<Vec<_>>()
+        .into_iter()
     }
 }
 
@@ -282,7 +284,7 @@ impl IrItemBuckets {
 
 impl IntoIterator for IrItemBuckets {
     type Item = Item;
-    type IntoIter = impl Iterator<Item = Self::Item>;
+    type IntoIter = std::vec::IntoIter<Item>;
 
     fn into_iter(self) -> Self::IntoIter {
         let IrItemBuckets {
@@ -332,6 +334,8 @@ impl IntoIterator for IrItemBuckets {
         };
 
         iterate![..if_def_items, ..misc_namespace_item]
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }
 

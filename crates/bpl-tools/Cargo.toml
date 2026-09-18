@@ -6,7 +6,7 @@ license = "MPL-2.0"
 description = """
 Dead code eliminator for the Boogie intermediate verification language
 """
-edition = "2021"
+edition = "2024"
 
 [[bin]]
 name = "bpl-inliner"

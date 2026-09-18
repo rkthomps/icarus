@@ -6,7 +6,7 @@ license = "MPL-2.0"
 description = """
 AST, parser, and printer for the Boogie intermediate verification language
 """
-edition = "2021"
+edition = "2024"
 
 [build-dependencies]
 anyhow = "1.0.28"
