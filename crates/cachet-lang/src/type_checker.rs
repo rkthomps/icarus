@@ -12,13 +12,13 @@ use iterate::iterate;
 use lazy_static::lazy_static;
 use typed_index_collections::TiVec;
 
+use crate::FrontendError;
 use crate::ast::{
     ArithBinOper, BinOper, BlockKind, CastSafety, CompareBinOper, Ident, MaybeSpanned, NegateKind,
     Path, Span, Spanned, VarParamKind,
 };
 use crate::built_in::{BuiltInType, BuiltInVar, IdentEnum, Signedness, Width};
 use crate::resolver;
-use crate::FrontendError;
 
 pub use crate::type_checker::ast::*;
 pub use crate::type_checker::error::*;
@@ -804,11 +804,15 @@ impl<'a, 'b> ScopedTypeChecker<'a, 'b> {
     ) -> (EnumSet<ArgKind>, Arg) {
         let (parent, struct_field_index, field) = self.type_check_field_access(&arg.value);
         let Some(field) = field else {
-            return (ArgKind::Expr | ArgKind::Label, Expr::from(FieldAccessExpr {
-                parent,
-                type_: self.unknown_type(),
-                field: struct_field_index,
-            }).into());
+            return (
+                ArgKind::Expr | ArgKind::Label,
+                Expr::from(FieldAccessExpr {
+                    parent,
+                    type_: self.unknown_type(),
+                    field: struct_field_index,
+                })
+                .into(),
+            );
         };
 
         match field {

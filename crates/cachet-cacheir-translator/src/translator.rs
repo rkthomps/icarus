@@ -445,8 +445,7 @@ pub fn translate(stub: &stub::Stub) -> Mod {
                         cond: Spanned::internal(Expr::Invoke(Call {
                             target: Spanned::internal(STRING_PATH.nest("isAtom")),
                             args: Spanned::internal(vec![Spanned::internal(
-                                generate_from_addr_call(*STRING_PATH, fact.string)
-                                    .into(),
+                                generate_from_addr_call(*STRING_PATH, fact.string).into(),
                             )]),
                         })),
                     }
