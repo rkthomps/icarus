@@ -15,7 +15,7 @@ use cachet_lang::ast::{
 };
 pub use cachet_lang::normalizer::{LocalLabelIndex, LocalVarIndex};
 
-use cachet_util::{box_from, chain_from, deref_from, fmt_join, fmt_join_trailing, AffixWriter};
+use cachet_util::{AffixWriter, box_from, chain_from, deref_from, fmt_join, fmt_join_trailing};
 
 #[derive(Clone, Copy, Debug, Display)]
 #[display(fmt = "{}_{}", kind, ident)]

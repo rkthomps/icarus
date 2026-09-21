@@ -8,7 +8,7 @@ use derive_more::{Display, From};
 use typed_index_collections::TiVec;
 
 use cachet_util::{
-    box_from, deref_from, fmt_join, fmt_join_trailing, typed_field_index, AffixWriter,
+    AffixWriter, box_from, deref_from, fmt_join, fmt_join_trailing, typed_field_index,
 };
 
 use crate::ast::{

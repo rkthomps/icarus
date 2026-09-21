@@ -13,13 +13,13 @@ use enum_iterator::IntoEnumIterator;
 use enumset::EnumSet;
 use typed_index_collections::{TiSlice, TiVec};
 
-use cachet_util::{collect_eager, deref_from, MaybeOwned};
+use cachet_util::{MaybeOwned, collect_eager, deref_from};
 
+use crate::FrontendError;
 use crate::ast::{Ident, Path, Spanned};
 use crate::built_in::{BuiltInAttr, BuiltInType, BuiltInVar, IdentEnum};
 use crate::parser;
 use crate::util::map_spanned;
-use crate::FrontendError;
 
 pub use crate::resolver::ast::*;
 pub use crate::resolver::error::*;

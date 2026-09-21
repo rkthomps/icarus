@@ -20,7 +20,7 @@ use cachet_lang::flattener::{self, HasAttrs, Typed};
 use cachet_util::MaybeOwned;
 
 use crate::bpl::ast::*;
-use crate::bpl::flow::{trace_entry_point, EmitNode, EmitSucc, FlowGraph};
+use crate::bpl::flow::{EmitNode, EmitSucc, FlowGraph, trace_entry_point};
 
 mod ast;
 mod flow;
@@ -1532,7 +1532,9 @@ impl<'a, 'b> ScopedCompiler<'a, 'b> {
         // Local variables are pre-declared at the top of the block in Boogie,
         // so no need to insert a separate assign statement if there's nothing
         // to assign. This comes up in, e.g., compiling `out let foo` arguments.
-        let Some(rhs) = let_stmt.rhs.as_ref() else { return };
+        let Some(rhs) = let_stmt.rhs.as_ref() else {
+            return;
+        };
 
         let lhs_var_ident = LocalVarIdent {
             ident: self.context.local(let_stmt.lhs).ident.value,
