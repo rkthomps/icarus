@@ -1,5 +1,5 @@
 use cachet_lang::parser::Item;
-use clang::{Entity, EntityKind};
+use clang::{Entity, EntityKind, TypeKind};
 use std::fmt;
 
 /// A "small C++": the subset of the clang AST a CacheIR stub generator body
@@ -35,7 +35,7 @@ pub struct IfStmt {
 #[derive(Clone, Debug)]
 pub struct LetStmt {
     pub name: String,
-    pub ty: String,
+    pub ty: Type,
     pub init: Option<Expr>,
 }
 
@@ -60,6 +60,9 @@ pub enum Expr {
     Ref(Ref),
     EnumConst(EnumConst),
     Lit(Lit),
+    /// `this`. Its type is a pointer to the enclosing class, so it usually
+    /// appears under a dereference: `*this`.
+    This,
 }
 
 #[derive(Clone, Debug)]
@@ -70,12 +73,15 @@ pub struct Call {
 
 #[derive(Clone, Debug)]
 pub enum Callee {
-    /// `writer.foo(..)` — the calls that become `emit` in Cachet.
-    Writer(String),
     /// A free function, e.g. `EmitGuardToDoubleForToNumber`.
     Free(String),
-    /// Any other method on the generator itself, e.g. `trackAttached`.
-    Method(String),
+    /// A method, with what it was called on: `v.isNumber()` is
+    /// `Method { recv: Some(Param("v")), name: "isNumber" }`. `recv` is `None`
+    /// for an implicit `this`, as in `trackAttached("..")`.
+    Method {
+        recv: Option<Box<Expr>>,
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -93,13 +99,63 @@ pub struct BinaryOp {
 
 /// A name in expression position, resolved to what it refers to.
 #[derive(Clone, Debug)]
-pub enum Ref {
+pub struct Ref {
+    pub kind: RefKind,
+    pub name: String,
+    pub ty: Type,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefKind {
     /// A field on the generator: `op_`, `lhsVal_`, `rhsVal_`, `writer`.
-    Field(String),
+    Field,
     /// A parameter of the generator method: `lhsId`, `rhsId`.
-    Param(String),
+    Param,
     /// A local introduced by a `LetStmt`: `lhs`, `rhs`.
-    Local(String),
+    Local,
+}
+
+/// A C++ type, with the structure the name only renders.
+///
+/// `HandleValue`, the type of `lhsVal_`, is:
+///
+/// ```text
+/// Type {
+///     scope: ["JS", "Handle"],
+///     args: [Type { scope: ["JS", "Value"], .. }],
+///     indirection: Value,
+///     is_const: false,
+///     spelled: "HandleValue",
+/// }
+/// ```
+///
+/// `scope` and `args` come from the canonical type, so typedefs are seen
+/// through and namespaces are explicit -- a translation table keys on those.
+/// `spelled` keeps the source's own words for dumps.
+#[derive(Clone, Debug)]
+pub struct Type {
+    /// Namespace path and the type's own name: `["JS", "Handle"]`. A builtin
+    /// has no declaration, so it is a single element: `["bool"]`.
+    pub scope: Vec<String>,
+    /// Template arguments, empty for a non-generic type.
+    pub args: Vec<Type>,
+    pub indirection: Indirection,
+    /// Constness of the value, or of the pointee for a reference: `true` for
+    /// both `const Value` and `const Value &`.
+    pub is_const: bool,
+    /// The type as written, typedef intact: `HandleValue`.
+    pub spelled: String,
+}
+
+/// Whether a name denotes a value or stands in for one. Constness is separate,
+/// so `const T&` is `Ref` with `is_const`, not a kind of its own. Rvalue
+/// references are not modeled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Indirection {
+    Value,
+    Ref,
+    /// `T*`. Unlike a reference it can be null and can be reseated.
+    Ptr,
 }
 
 /// `JSOp::StrictEq`, `AttachDecision::Attach`.
@@ -113,6 +169,7 @@ pub struct EnumConst {
 pub enum Lit {
     Str(String),
     Int(i64),
+    Double(f64),
     Bool(bool),
 }
 
@@ -153,6 +210,11 @@ pub enum Unsupported {
         name: String,
         loc: Loc,
     },
+    /// A type outside the subset: a pointer or an rvalue reference.
+    Type {
+        spelled: String,
+        loc: Loc,
+    },
     /// A node of a modeled kind whose children aren't shaped as expected.
     Malformed {
         what: String,
@@ -167,6 +229,9 @@ impl fmt::Display for Unsupported {
             Unsupported::Expr { kind, loc } => write!(f, "{loc}: unsupported expression {kind:?}"),
             Unsupported::Macro { name, loc } => write!(f, "{loc}: unsupported macro `{name}`"),
             Unsupported::Callee { name, loc } => write!(f, "{loc}: unsupported callee `{name}`"),
+            Unsupported::Type { spelled, loc } => {
+                write!(f, "{loc}: unsupported type `{spelled}`")
+            }
             Unsupported::Malformed { what, loc } => write!(f, "{loc}: {what}"),
         }
     }
@@ -176,41 +241,37 @@ impl std::error::Error for Unsupported {}
 
 pub type Result<T> = std::result::Result<T, Unsupported>;
 
-/// Why a generator couldn't be extracted. Separates "this isn't a stub
-/// generator" from "this generator uses C++ we don't model": the first means
-/// the caller pointed at the wrong entity, the second is a gap in the subset
-/// and names the generator so a sweep over many of them stays readable.
+/// Why a definition couldn't be extracted. Separates "this isn't something we
+/// extract" from "this uses C++ we don't model": the first means the caller
+/// pointed at the wrong entity, the second is a gap in the subset. `Body`
+/// names the unit it came from so a sweep over many of them stays readable.
 #[derive(Clone, Debug)]
-pub enum GeneratorError {
-    NotAGenerator {
+pub enum Error {
+    Signature {
         what: String,
         loc: Loc,
     },
     Body {
-        class: String,
-        method: String,
+        /// `CompareIRGenerator::tryAttachNumber`, or a bare function name.
+        unit: String,
         cause: Unsupported,
     },
 }
 
-impl fmt::Display for GeneratorError {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            GeneratorError::NotAGenerator { what, loc } => write!(f, "{loc}: {what}"),
-            GeneratorError::Body {
-                class,
-                method,
-                cause,
-            } => write!(f, "{class}::{method}: {cause}"),
+            Error::Signature { what, loc } => write!(f, "{loc}: {what}"),
+            Error::Body { unit, cause } => write!(f, "{unit}: {cause}"),
         }
     }
 }
 
-impl std::error::Error for GeneratorError {
+impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            GeneratorError::NotAGenerator { .. } => None,
-            GeneratorError::Body { cause, .. } => Some(cause),
+            Error::Signature { .. } => None,
+            Error::Body { cause, .. } => Some(cause),
         }
     }
 }
@@ -283,13 +344,9 @@ fn operator_spelling(e: Entity) -> Option<String> {
 /// `lhsVal_` costs four such wrappers before reaching the `FieldDecl`.
 fn strip(mut e: Entity) -> Entity {
     loop {
-        let implicit = matches!(
-            e.get_reference().map(|r| r.get_kind()),
-            Some(EntityKind::Constructor | EntityKind::ConversionFunction)
-        );
         let peel = match e.get_kind() {
             EntityKind::UnexposedExpr | EntityKind::ParenExpr => true,
-            EntityKind::CallExpr | EntityKind::MemberRefExpr if implicit => true,
+            EntityKind::CallExpr | EntityKind::MemberRefExpr => is_implicit_conversion(e),
             _ => false,
         };
         match e.get_children().as_slice() {
@@ -297,6 +354,110 @@ fn strip(mut e: Entity) -> Entity {
             _ => return e,
         }
     }
+}
+
+/// Whether a constructor or conversion call was inserted by the compiler
+/// rather than written down.
+///
+/// Both look the same structurally -- a `CallExpr` resolving to a `Constructor`
+/// with one argument -- so kind alone can't tell `AutoOutputRegister output(*this)`
+/// (meaningful) from the implicit copy around `lhsId` (noise). What separates
+/// them is source extent: an implicit call spans exactly its argument, while a
+/// written one also covers the type name and parentheses.
+fn is_implicit_conversion(e: Entity) -> bool {
+    if !matches!(
+        e.get_reference().map(|r| r.get_kind()),
+        Some(EntityKind::Constructor | EntityKind::ConversionFunction)
+    ) {
+        return false;
+    }
+    let (Some(outer), Some(child)) = (e.get_range(), e.get_children().first().and_then(|c| c.get_range()))
+    else {
+        return false;
+    };
+    let extent = |r: clang::source::SourceRange| {
+        let (s, e) = (r.get_start().get_file_location(), r.get_end().get_file_location());
+        (s.line, s.column, e.line, e.column)
+    };
+    extent(outer) == extent(child)
+}
+
+/// A declaration's type.
+fn extract_type(decl: Entity) -> Result<Type> {
+    let ty = decl.get_type().ok_or_else(|| Unsupported::Malformed {
+        what: format!("`{}` has no type", decl.get_name().unwrap_or_default()),
+        loc: loc(decl),
+    })?;
+    type_of(ty, decl)
+}
+
+/// Pointers and rvalue references are refused rather than approximated: `T*`
+/// adds nullability and `T&&` move semantics, neither of which we model.
+fn type_of(ty: clang::Type, at: Entity) -> Result<Type> {
+    let spelled = ty.get_display_name();
+    let canonical = ty.get_canonical_type();
+
+    // Look through a reference to describe what it refers to; the indirection
+    // is recorded separately.
+    let (indirection, referent) = match canonical.get_pointee_type() {
+        None => (Indirection::Value, canonical),
+        Some(pointee) => match canonical.get_kind() {
+            TypeKind::LValueReference => (Indirection::Ref, pointee),
+            TypeKind::Pointer => (Indirection::Ptr, pointee),
+            // RValueReference and the exotic pointer kinds.
+            _ => {
+                return Err(Unsupported::Type {
+                    spelled,
+                    loc: loc(at),
+                });
+            }
+        },
+    };
+
+    // A builtin (`bool`, `int`) has no declaration to take a scope from, so its
+    // own name stands in for one.
+    let scope = match referent.get_declaration() {
+        Some(decl) => scope_path(decl),
+        None => vec![
+            referent
+                .get_display_name()
+                .trim_start_matches("const ")
+                .to_string(),
+        ],
+    };
+
+    let args = referent
+        .get_template_argument_types()
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .map(|arg| type_of(arg, at))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Type {
+        scope,
+        args,
+        indirection,
+        is_const: referent.is_const_qualified(),
+        spelled,
+    })
+}
+
+/// Enclosing namespaces and classes, outermost first, ending with the entity's
+/// own name: `["JS", "Handle"]`.
+fn scope_path(mut e: Entity) -> Vec<String> {
+    let mut path = vec![e.get_name().unwrap_or_default()];
+    while let Some(parent) = e.get_semantic_parent() {
+        match parent.get_kind() {
+            EntityKind::Namespace | EntityKind::ClassDecl | EntityKind::StructDecl => {
+                path.push(parent.get_name().unwrap_or_default());
+                e = parent;
+            }
+            _ => break,
+        }
+    }
+    path.reverse();
+    path
 }
 
 fn is_type_ref(e: Entity) -> bool {
@@ -533,14 +694,7 @@ fn extract_decl(e: Entity) -> Result<LetStmt> {
         what: String::from("unnamed variable"),
         loc: loc(var),
     })?;
-    let ty = var
-        .get_type()
-        .ok_or_else(|| Unsupported::Malformed {
-            what: format!("variable {name} has no type"),
-            loc: loc(var),
-        })?
-        .get_canonical_type()
-        .get_display_name();
+    let ty = extract_type(var)?;
     let init = var
         .get_children()
         .into_iter()
@@ -555,6 +709,7 @@ fn extract_expr(e: Entity) -> Result<Expr> {
     let e = strip(e);
     match e.get_kind() {
         EntityKind::CallExpr => Ok(Expr::Call(extract_call(e)?)),
+        EntityKind::ThisExpr => Ok(Expr::This),
         EntityKind::DeclRefExpr | EntityKind::MemberRefExpr => extract_ref(e),
         EntityKind::UnaryOperator => {
             let operand =
@@ -592,9 +747,10 @@ fn extract_expr(e: Entity) -> Result<Expr> {
                 rhs: Box::new(extract_expr(*rhs)?),
             }))
         }
-        EntityKind::IntegerLiteral | EntityKind::StringLiteral | EntityKind::BoolLiteralExpr => {
-            extract_lit(e)
-        }
+        EntityKind::IntegerLiteral
+        | EntityKind::FloatingLiteral
+        | EntityKind::StringLiteral
+        | EntityKind::BoolLiteralExpr => extract_lit(e),
         kind => Err(Unsupported::Expr { kind, loc: loc(e) }),
     }
 }
@@ -615,22 +771,16 @@ fn extract_call(e: Entity) -> Result<Call> {
     let callee = match target.get_kind() {
         EntityKind::FunctionDecl | EntityKind::FunctionTemplate => Callee::Free(name),
         EntityKind::Method => {
-            // `writer.foo(..)`: the callee's own child is the object, and when
-            // that resolves to the generator's `writer` field the call is an
-            // emit rather than an ordinary method call.
-            let on_writer = callee_expr
+            // For `v.isNumber()` the callee is a `MemberRefExpr` whose own
+            // child is the receiver. An implicit `this` leaves it childless.
+            let recv = callee_expr
                 .get_children()
                 .into_iter()
-                .map(strip)
-                .any(|obj| {
-                    obj.get_reference().map(|r| r.get_kind()) == Some(EntityKind::FieldDecl)
-                        && obj.get_name().as_deref() == Some("writer")
-                });
-            if on_writer {
-                Callee::Writer(name)
-            } else {
-                Callee::Method(name)
-            }
+                .next()
+                .map(extract_expr)
+                .transpose()?
+                .map(Box::new);
+            Callee::Method { recv, name }
         }
         _ => return Err(Unsupported::Callee { name, loc: loc(e) }),
     };
@@ -659,9 +809,21 @@ fn extract_ref(e: Entity) -> Result<Expr> {
                 })?;
             Ok(Expr::EnumConst(EnumConst { ty, name }))
         }
-        EntityKind::ParmDecl => Ok(Expr::Ref(Ref::Param(name))),
-        EntityKind::VarDecl => Ok(Expr::Ref(Ref::Local(name))),
-        EntityKind::FieldDecl => Ok(Expr::Ref(Ref::Field(name))),
+        EntityKind::ParmDecl => Ok(Expr::Ref(Ref {
+            kind: RefKind::Param,
+            name,
+            ty: extract_type(target)?,
+        })),
+        EntityKind::VarDecl => Ok(Expr::Ref(Ref {
+            kind: RefKind::Local,
+            name,
+            ty: extract_type(target)?,
+        })),
+        EntityKind::FieldDecl => Ok(Expr::Ref(Ref {
+            kind: RefKind::Field,
+            name,
+            ty: extract_type(target)?,
+        })),
         _ => Err(Unsupported::Expr {
             kind: e.get_kind(),
             loc: loc(e),
@@ -689,6 +851,7 @@ fn extract_lit(e: Entity) -> Result<Expr> {
                 i64::try_from(n).map_err(|_| malformed())?,
             )));
         }
+        Some(Float(x)) => return Ok(Expr::Lit(Lit::Double(x))),
         Some(String(s)) | Some(CFString(s)) | Some(ObjCString(s)) | Some(Other(s)) => {
             return Ok(Expr::Lit(Lit::Str(s.to_string_lossy().into_owned())));
         }
@@ -715,31 +878,74 @@ fn extract_lit(e: Entity) -> Result<Expr> {
             .parse()
             .map(|n| Expr::Lit(Lit::Int(n)))
             .map_err(|_| malformed()),
+        EntityKind::FloatingLiteral => text
+            .trim_end_matches(['f', 'F', 'l', 'L'])
+            .parse()
+            .map(|x| Expr::Lit(Lit::Double(x)))
+            .map_err(|_| malformed()),
         kind => Err(Unsupported::Expr { kind, loc: loc(e) }),
     }
 }
 
-pub struct GeneratorParam {
+/// A parameter of a generator or a function.
+#[derive(Clone, Debug)]
+pub struct Param {
     pub name: String,
-    pub ty: String,
+    pub ty: Type,
 }
 
-pub struct GeneratorImpl {
+/// Parameters of a definition, with their types. `unit` only names the
+/// definition in error messages.
+fn extract_params(def: Entity, unit: &str) -> std::result::Result<Vec<Param>, Error> {
+    def.get_arguments()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| {
+            let name = p.get_name().ok_or_else(|| Error::Signature {
+                what: format!("unnamed parameter in {unit}"),
+                loc: loc(p),
+            })?;
+            let ty = extract_type(p).map_err(|e| Error::Signature {
+                what: format!("parameter {name}: {e}"),
+                loc: loc(p),
+            })?;
+            Ok(Param { name, ty })
+        })
+        .collect()
+}
+
+/// The `CompoundStmt` child of a definition, extracted into the subset.
+fn extract_body(def: Entity, unit: &str) -> std::result::Result<CompoundStmt, Error> {
+    let body = def
+        .get_children()
+        .into_iter()
+        .find(|c| c.get_kind() == EntityKind::CompoundStmt)
+        .ok_or_else(|| Error::Signature {
+            what: format!("{unit} has no body"),
+            loc: loc(def),
+        })?;
+    extract_compound_stmt(body).map_err(|cause| Error::Body {
+        unit: unit.to_string(),
+        cause,
+    })
+}
+
+/// A stub generator: a method definition on a `*IRGenerator` class.
+#[derive(Clone, Debug)]
+pub struct GenDef {
     pub class: String,
     pub method: String,
-    pub params: Vec<GeneratorParam>,
+    pub params: Vec<Param>,
     pub body: CompoundStmt,
 }
 
 /// Finds a generator's shape and extracts its body into the modeled subset.
 /// Everything downstream works on the result, never on clang entities.
-pub fn get_generator_impl(
-    generator: &Entity<'_>,
-) -> std::result::Result<GeneratorImpl, GeneratorError> {
+pub fn get_gen_def(generator: &Entity<'_>) -> std::result::Result<GenDef, Error> {
     let generator = *generator;
 
     if generator.get_kind() != EntityKind::Method {
-        return Err(GeneratorError::NotAGenerator {
+        return Err(Error::Signature {
             what: format!("expected a method, found {:?}", generator.get_kind()),
             loc: loc(generator),
         });
@@ -747,7 +953,7 @@ pub fn get_generator_impl(
     // A declaration has no body to translate; we need the out-of-line
     // definition in CacheIR.cpp, not the one in CacheIRGenerator.h.
     if !generator.is_definition() {
-        return Err(GeneratorError::NotAGenerator {
+        return Err(Error::Signature {
             what: String::from("expected a method definition, found a declaration"),
             loc: loc(generator),
         });
@@ -759,60 +965,80 @@ pub fn get_generator_impl(
         .get_semantic_parent()
         .filter(|p| matches!(p.get_kind(), EntityKind::ClassDecl | EntityKind::StructDecl))
         .and_then(|p| p.get_name())
-        .ok_or_else(|| GeneratorError::NotAGenerator {
+        .ok_or_else(|| Error::Signature {
             what: String::from("method has no owning class"),
             loc: loc(generator),
         })?;
 
     let method = generator
         .get_name()
-        .ok_or_else(|| GeneratorError::NotAGenerator {
+        .ok_or_else(|| Error::Signature {
             what: String::from("method has no name"),
             loc: loc(generator),
         })?;
 
-    let params = generator
-        .get_arguments()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| {
-            let name = p.get_name().ok_or_else(|| GeneratorError::NotAGenerator {
-                what: format!("unnamed parameter in {class}::{method}"),
-                loc: loc(p),
-            })?;
-            // Canonical: typedefs and aliases stripped, so the translator keys
-            // on `js::jit::ValOperandId` rather than however it was spelled.
-            let ty = p
-                .get_type()
-                .ok_or_else(|| GeneratorError::NotAGenerator {
-                    what: format!("parameter {name} has no type"),
-                    loc: loc(p),
-                })?
-                .get_canonical_type()
-                .get_display_name();
-            Ok(GeneratorParam { name, ty })
-        })
-        .collect::<std::result::Result<Vec<_>, GeneratorError>>()?;
+    let unit = format!("{class}::{method}");
+    let params = extract_params(generator, &unit)?;
+    let body = extract_body(generator, &unit)?;
 
-    let body = generator
-        .get_children()
-        .into_iter()
-        .find(|c| c.get_kind() == EntityKind::CompoundStmt)
-        .ok_or_else(|| GeneratorError::NotAGenerator {
-            what: format!("{class}::{method} has no body"),
-            loc: loc(generator),
-        })?;
-
-    let body = extract_compound_stmt(body).map_err(|cause| GeneratorError::Body {
-        class: class.clone(),
-        method: method.clone(),
-        cause,
-    })?;
-
-    Ok(GeneratorImpl {
+    Ok(GenDef {
         class,
         method,
         params,
+        body,
+    })
+}
+
+/// A free function defined in the CacheIR sources, e.g.
+/// `CanConvertToDoubleForToNumber` or `EmitGuardToDoubleForToNumber`.
+#[derive(Clone, Debug)]
+pub struct FnDef {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Type,
+    pub body: CompoundStmt,
+}
+
+/// Extracts a free function's definition into the modeled subset. Unlike a
+/// generator it has no owning class, and its return type is explicit rather
+/// than always `AttachDecision`.
+pub fn get_fn_def(function: &Entity<'_>) -> std::result::Result<FnDef, Error> {
+    let function = *function;
+
+    if function.get_kind() != EntityKind::FunctionDecl {
+        return Err(Error::Signature {
+            what: format!("expected a function, found {:?}", function.get_kind()),
+            loc: loc(function),
+        });
+    }
+    if !function.is_definition() {
+        return Err(Error::Signature {
+            what: String::from("expected a function definition, found a declaration"),
+            loc: loc(function),
+        });
+    }
+
+    let name = function.get_name().ok_or_else(|| Error::Signature {
+        what: String::from("function has no name"),
+        loc: loc(function),
+    })?;
+
+    let ret = function.get_result_type().ok_or_else(|| Error::Signature {
+        what: format!("{name} has no return type"),
+        loc: loc(function),
+    })?;
+    let ret = type_of(ret, function).map_err(|e| Error::Signature {
+        what: format!("return type: {e}"),
+        loc: loc(function),
+    })?;
+
+    let params = extract_params(function, &name)?;
+    let body = extract_body(function, &name)?;
+
+    Ok(FnDef {
+        name,
+        params,
+        ret,
         body,
     })
 }
@@ -827,11 +1053,21 @@ fn indent(f: &mut fmt::Formatter, depth: usize) -> fmt::Result {
     write!(f, "{:indent$}", "", indent = depth * 2)
 }
 
-impl fmt::Display for GeneratorImpl {
+impl fmt::Display for GenDef {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "Method `{}` [{}]", self.method, self.class)?;
         for p in &self.params {
-            writeln!(f, "  ParmDecl `{}` : {}", p.name, p.ty)?;
+            writeln!(f, "  ParmDecl `{}` : {}", p.name, p.ty.spelled)?;
+        }
+        fmt_block(f, &self.body, 1)
+    }
+}
+
+impl fmt::Display for FnDef {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "Function `{}` -> {}", self.name, self.ret.spelled)?;
+        for p in &self.params {
+            writeln!(f, "  ParmDecl `{}` : {}", p.name, p.ty.spelled)?;
         }
         fmt_block(f, &self.body, 1)
     }
@@ -876,7 +1112,7 @@ fn fmt_stmt(f: &mut fmt::Formatter, stmt: &Stmt, depth: usize) -> fmt::Result {
         }
         Stmt::Let(s) => {
             indent(f, depth)?;
-            writeln!(f, "VarDecl `{}` : {}", s.name, s.ty)?;
+            writeln!(f, "VarDecl `{}` : {}", s.name, s.ty.spelled)?;
             match &s.init {
                 Some(init) => fmt_expr(f, init, depth + 1),
                 None => Ok(()),
@@ -906,12 +1142,19 @@ fn fmt_expr(f: &mut fmt::Formatter, expr: &Expr, depth: usize) -> fmt::Result {
     indent(f, depth)?;
     match expr {
         Expr::Call(c) => {
-            let (kind, name) = match &c.callee {
-                Callee::Writer(n) => ("Writer", n),
-                Callee::Free(n) => ("Free", n),
-                Callee::Method(n) => ("Method", n),
-            };
-            writeln!(f, "Call {kind} `{name}`")?;
+            match &c.callee {
+                Callee::Free(name) => writeln!(f, "Call Free `{name}`")?,
+                Callee::Method { recv, name } => {
+                    writeln!(f, "Call Method `{name}`")?;
+                    // The receiver is printed first, labelled, so it can't be
+                    // mistaken for an argument.
+                    if let Some(recv) = recv {
+                        indent(f, depth + 1)?;
+                        writeln!(f, "Recv")?;
+                        fmt_expr(f, recv, depth + 2)?;
+                    }
+                }
+            }
             for arg in &c.args {
                 fmt_expr(f, arg, depth + 1)?;
             }
@@ -926,21 +1169,26 @@ fn fmt_expr(f: &mut fmt::Formatter, expr: &Expr, depth: usize) -> fmt::Result {
             fmt_expr(f, &b.lhs, depth + 1)?;
             fmt_expr(f, &b.rhs, depth + 1)
         }
-        Expr::Ref(r) => match r {
-            Ref::Field(n) => writeln!(f, "Field `{n}`"),
-            Ref::Param(n) => writeln!(f, "Param `{n}`"),
-            Ref::Local(n) => writeln!(f, "Local `{n}`"),
-        },
+        Expr::Ref(r) => {
+            let kind = match r.kind {
+                RefKind::Field => "Field",
+                RefKind::Param => "Param",
+                RefKind::Local => "Local",
+            };
+            writeln!(f, "{kind} `{}` : {}", r.name, r.ty.spelled)
+        }
+        Expr::This => writeln!(f, "This"),
         Expr::EnumConst(e) => writeln!(f, "EnumConst `{}::{}`", e.ty, e.name),
         Expr::Lit(l) => match l {
             Lit::Str(s) => writeln!(f, "Lit `{s:?}`"),
             Lit::Int(n) => writeln!(f, "Lit `{n}`"),
+            Lit::Double(x) => writeln!(f, "Lit `{x:?}`"),
             Lit::Bool(b) => writeln!(f, "Lit `{b}`"),
         },
     }
 }
 
 fn translate(generator: Entity) -> std::result::Result<Vec<Item>, std::string::String> {
-    let generator_impl = get_generator_impl(&generator);
+    let gen_def = get_gen_def(&generator);
     Err(std::string::String::from("Ni"))
 }

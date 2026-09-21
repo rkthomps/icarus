@@ -5,7 +5,7 @@
 //!           [--calls] [--depth N] [--subset]
 //!
 //! `--subset` dumps the generator lowered into the modeled C++ subset
-//! (`cpp_subset::GeneratorImpl`) instead of the raw clang AST.
+//! (`cpp_subset::GenDef`) instead of the raw clang AST.
 //!
 //! `--db` defaults to the compile database that build.rs generated, and
 //! `--source` to js/src/jit/CacheIR.cpp.
@@ -392,10 +392,17 @@ fn main() {
         println!("// {wanted} at {}:{}", source.display(), l.line);
     }
     if subset {
-        match phoenix::cpp_subset::get_generator_impl(&def) {
-            Ok(generator) => print!("{generator}"),
+        // A method is a stub generator; a free function is a helper the
+        // generators call.
+        let extracted = if def.get_kind() == EntityKind::FunctionDecl {
+            phoenix::cpp_subset::get_fn_def(&def).map(|f| f.to_string())
+        } else {
+            phoenix::cpp_subset::get_gen_def(&def).map(|g| g.to_string())
+        };
+        match extracted {
+            Ok(text) => print!("{text}"),
             Err(e) => {
-                // `GeneratorError` already names the generator or the location.
+                // `cpp_subset::Error` already names the unit or the location.
                 eprintln!("cannot extract subset: {e}");
                 std::process::exit(1);
             }
