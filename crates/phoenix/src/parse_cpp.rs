@@ -1,15 +1,3 @@
-//! Dump the fully type-resolved clang AST of a single CacheIR stub generator.
-//!
-//! Usage:
-//!   phoenix <Class::method> [--db compile_commands.json] [--source file.cpp]
-//!           [--calls] [--depth N] [--translate]
-//!
-//! `--translate` dumps the generator lowered into the modeled C++ subset
-//! (`translate::GeneratorImpl`) instead of the raw clang AST.
-//!
-//! `--db` defaults to the compile database that build.rs generated, and
-//! `--source` to js/src/jit/CacheIR.cpp.
-//!
 //! The compile database comes from a configured SpiderMonkey objdir
 //! (`mach configure && mach build pre-export export && mach build-backend -b CompileDB`).
 //! We reuse the exact flags mozbuild would compile the file with, so every
@@ -20,7 +8,7 @@
 //! (`~/.mozbuild/clang`), so the compile flags and the parser always come from
 //! the same self-consistent toolchain. Set `LIBCLANG_PATH` to override.
 
-use clang::{Clang, Entity, EntityKind, Index};
+use clang::{Clang, Entity, EntityKind, Index, TranslationUnit, diagnostic::Diagnostic};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -320,9 +308,28 @@ fn call_graph(f: Entity, depth: usize, max_depth: usize, seen: &mut Vec<String>)
     }
 }
 
+fn parse<'i>(index: &'i Index<'i>, source: &Path, flags: &Vec<String>) -> TranslationUnit<'i> {
+    let tu = index
+        .parser(&source)
+        .arguments(flags)
+        .skip_function_bodies(false)
+        .parse()
+        .expect("parse translation unit");
+    tu
+}
+
+fn errors<'a>(tu: &'a TranslationUnit<'a>) -> Vec<Diagnostic<'a>> {
+    let errors: Vec<_> = tu
+        .get_diagnostics()
+        .into_iter()
+        .filter(|d| d.get_severity() >= clang::diagnostic::Severity::Error)
+        .collect();
+    errors
+}
+
 fn main() {
     // phoenix <Class::method> [--db compile_commands.json] [--source file.cpp]
-    //         [--calls] [--depth N] [--translate]
+    //         [--calls] [--depth N]
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut take_flag = |name: &str| -> bool {
         args.iter()
@@ -331,7 +338,6 @@ fn main() {
             .is_some()
     };
     let calls = take_flag("--calls");
-    let translate = take_flag("--translate");
     let mut take_opt = |name: &str| -> Option<String> {
         let i = args.iter().position(|a| a == name)?;
         args.remove(i);
@@ -344,7 +350,7 @@ fn main() {
     let source = take_opt("--source").unwrap_or_else(|| "js/src/jit/CacheIR.cpp".into());
     let (Some(db), [wanted]) = (db, args.as_slice()) else {
         eprintln!(
-            "usage: phoenix <Class::method> [--db compile_commands.json] [--source file.cpp] [--calls] [--depth N] [--translate]\n\
+            "usage: phoenix <Class::method> [--db compile_commands.json] [--source file.cpp] [--calls] [--depth N]\n\
              --db defaults to the objdir build.rs set up ({})",
             option_env!("PHOENIX_COMPILE_DB").unwrap_or("none; built with PHOENIX_SKIP_SETUP")
         );
@@ -361,18 +367,10 @@ fn main() {
     let index = Index::new(
         &clang, /* exclude_pch_decls */ false, /* diagnostics */ true,
     );
-    let tu = index
-        .parser(&source)
-        .arguments(&flags)
-        .skip_function_bodies(false)
-        .parse()
-        .expect("parse translation unit");
 
-    let errors: Vec<_> = tu
-        .get_diagnostics()
-        .into_iter()
-        .filter(|d| d.get_severity() >= clang::diagnostic::Severity::Error)
-        .collect();
+    let tu = parse(&index, &source, &flags);
+    let errors = errors(&tu);
+
     for d in &errors {
         eprintln!("{}", d);
     }
@@ -391,16 +389,7 @@ fn main() {
         let l = loc.get_file_location();
         println!("// {wanted} at {}:{}", source.display(), l.line);
     }
-    if translate {
-        match phoenix::translate::get_generator_impl(&def) {
-            Ok(generator) => print!("{generator}"),
-            Err(e) => {
-                // `GeneratorError` already names the generator or the location.
-                eprintln!("cannot translate: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else if calls {
+    if calls {
         call_graph(def, 0, max_depth, &mut Vec::new());
     } else {
         dump(def, 0);
