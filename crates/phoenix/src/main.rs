@@ -2,10 +2,10 @@
 //!
 //! Usage:
 //!   phoenix <Class::method> [--db compile_commands.json] [--source file.cpp]
-//!           [--calls] [--depth N] [--translate]
+//!           [--calls] [--depth N] [--subset]
 //!
-//! `--translate` dumps the generator lowered into the modeled C++ subset
-//! (`translate::GeneratorImpl`) instead of the raw clang AST.
+//! `--subset` dumps the generator lowered into the modeled C++ subset
+//! (`cpp_subset::GeneratorImpl`) instead of the raw clang AST.
 //!
 //! `--db` defaults to the compile database that build.rs generated, and
 //! `--source` to js/src/jit/CacheIR.cpp.
@@ -322,7 +322,7 @@ fn call_graph(f: Entity, depth: usize, max_depth: usize, seen: &mut Vec<String>)
 
 fn main() {
     // phoenix <Class::method> [--db compile_commands.json] [--source file.cpp]
-    //         [--calls] [--depth N] [--translate]
+    //         [--calls] [--depth N] [--subset]
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut take_flag = |name: &str| -> bool {
         args.iter()
@@ -331,7 +331,7 @@ fn main() {
             .is_some()
     };
     let calls = take_flag("--calls");
-    let translate = take_flag("--translate");
+    let subset = take_flag("--subset");
     let mut take_opt = |name: &str| -> Option<String> {
         let i = args.iter().position(|a| a == name)?;
         args.remove(i);
@@ -344,7 +344,7 @@ fn main() {
     let source = take_opt("--source").unwrap_or_else(|| "js/src/jit/CacheIR.cpp".into());
     let (Some(db), [wanted]) = (db, args.as_slice()) else {
         eprintln!(
-            "usage: phoenix <Class::method> [--db compile_commands.json] [--source file.cpp] [--calls] [--depth N] [--translate]\n\
+            "usage: phoenix <Class::method> [--db compile_commands.json] [--source file.cpp] [--calls] [--depth N] [--subset]\n\
              --db defaults to the objdir build.rs set up ({})",
             option_env!("PHOENIX_COMPILE_DB").unwrap_or("none; built with PHOENIX_SKIP_SETUP")
         );
@@ -391,12 +391,12 @@ fn main() {
         let l = loc.get_file_location();
         println!("// {wanted} at {}:{}", source.display(), l.line);
     }
-    if translate {
-        match phoenix::translate::get_generator_impl(&def) {
+    if subset {
+        match phoenix::cpp_subset::get_generator_impl(&def) {
             Ok(generator) => print!("{generator}"),
             Err(e) => {
                 // `GeneratorError` already names the generator or the location.
-                eprintln!("cannot translate: {e}");
+                eprintln!("cannot extract subset: {e}");
                 std::process::exit(1);
             }
         }

@@ -176,7 +176,7 @@ impl std::error::Error for Unsupported {}
 
 pub type Result<T> = std::result::Result<T, Unsupported>;
 
-/// Why a generator couldn't be translated. Separates "this isn't a stub
+/// Why a generator couldn't be extracted. Separates "this isn't a stub
 /// generator" from "this generator uses C++ we don't model": the first means
 /// the caller pointed at the wrong entity, the second is a gap in the subset
 /// and names the generator so a sweep over many of them stays readable.
@@ -306,38 +306,38 @@ fn is_type_ref(e: Entity) -> bool {
     )
 }
 
-/// Translate a generator body into the modeled subset. The kind is checked
+/// Extract a generator body into the modeled subset. The kind is checked
 /// here so this is safe to call on any entity.
-pub fn translate_compound_stmt(body: Entity) -> Result<CompoundStmt> {
+pub fn extract_compound_stmt(body: Entity) -> Result<CompoundStmt> {
     if body.get_kind() != EntityKind::CompoundStmt {
         return Err(Unsupported::Malformed {
             what: format!("expected a CompoundStmt, found {:?}", body.get_kind()),
             loc: loc(body),
         });
     }
-    translate_block(body)
+    extract_block(body)
 }
 
-fn translate_block(block: Entity) -> Result<CompoundStmt> {
+fn extract_block(block: Entity) -> Result<CompoundStmt> {
     let mut stmts = Vec::new();
     for child in block.get_children() {
-        stmts.push(translate_stmt(child)?);
+        stmts.push(extract_stmt(child)?);
     }
     Ok(CompoundStmt { stmts })
 }
 
-fn translate_stmt(e: Entity) -> Result<Stmt> {
+fn extract_stmt(e: Entity) -> Result<Stmt> {
     if is_macro_expansion(e) {
-        return translate_macro(e);
+        return extract_macro(e);
     }
 
     match e.get_kind() {
-        EntityKind::IfStmt => Ok(Stmt::If(translate_if(e)?)),
-        EntityKind::DeclStmt => Ok(Stmt::Let(translate_decl(e)?)),
+        EntityKind::IfStmt => Ok(Stmt::If(extract_if(e)?)),
+        EntityKind::DeclStmt => Ok(Stmt::Let(extract_decl(e)?)),
         EntityKind::ReturnStmt => {
             let value = match e.get_children().as_slice() {
                 [] => None,
-                [v] => Some(translate_expr(*v)?),
+                [v] => Some(extract_expr(*v)?),
                 _ => {
                     return Err(Unsupported::Malformed {
                         what: String::from("return with multiple children"),
@@ -361,7 +361,7 @@ fn translate_stmt(e: Entity) -> Result<Stmt> {
             loc: loc(e),
         }),
         // Anything else in statement position is an expression statement.
-        _ => Ok(Stmt::Expr(translate_expr(e)?)),
+        _ => Ok(Stmt::Expr(extract_expr(e)?)),
     }
 }
 
@@ -369,7 +369,7 @@ fn translate_stmt(e: Entity) -> Result<Stmt> {
 /// unlisted is an error: its expansion is present but its intent isn't, and
 /// guessing from the expansion's shape is how `TRY_ATTACH` would get silently
 /// mistaken for an assertion.
-fn translate_macro(e: Entity) -> Result<Stmt> {
+fn extract_macro(e: Entity) -> Result<Stmt> {
     let name = macro_name(e).unwrap_or_else(|| String::from("<unknown>"));
     match name.as_str() {
         "MOZ_ASSERT" | "MOZ_RELEASE_ASSERT" | "MOZ_DIAGNOSTIC_ASSERT" => {
@@ -403,7 +403,7 @@ fn translate_macro(e: Entity) -> Result<Stmt> {
                     loc: loc(e),
                 })?;
             Ok(Stmt::Assert(AssertStmt {
-                guard: Some(translate_expr(*cond)?),
+                guard: Some(extract_expr(*cond)?),
                 cond: assert_cond(inner)?,
             }))
         }
@@ -444,7 +444,7 @@ fn assert_cond(do_stmt: Entity) -> Result<Expr> {
                 what: String::from("assertion check without a condition"),
                 loc: loc(do_stmt),
             })?;
-    translate_expr(peel_assert_glue(cond, &loc(do_stmt).file))
+    extract_expr(peel_assert_glue(cond, &loc(do_stmt).file))
 }
 
 /// Descend through the assertion macro's wrappers to the asserted expression.
@@ -489,7 +489,7 @@ fn spelling_file(e: Entity) -> Option<String> {
         .map(|s| s.to_string_lossy().into_owned())
 }
 
-fn translate_if(e: Entity) -> Result<IfStmt> {
+fn extract_if(e: Entity) -> Result<IfStmt> {
     let kids = e.get_children();
     let (cond, then, els) = match kids.as_slice() {
         [cond, then] => (*cond, *then, None),
@@ -502,23 +502,23 @@ fn translate_if(e: Entity) -> Result<IfStmt> {
         }
     };
     Ok(IfStmt {
-        cond: translate_expr(cond)?,
-        then: translate_branch(then)?,
-        els: els.map(translate_branch).transpose()?,
+        cond: extract_expr(cond)?,
+        then: extract_branch(then)?,
+        els: els.map(extract_branch).transpose()?,
     })
 }
 
 /// A branch is a block, or a single statement we wrap into one.
-fn translate_branch(e: Entity) -> Result<CompoundStmt> {
+fn extract_branch(e: Entity) -> Result<CompoundStmt> {
     if e.get_kind() == EntityKind::CompoundStmt {
-        return translate_block(e);
+        return extract_block(e);
     }
     Ok(CompoundStmt {
-        stmts: vec![translate_stmt(e)?],
+        stmts: vec![extract_stmt(e)?],
     })
 }
 
-fn translate_decl(e: Entity) -> Result<LetStmt> {
+fn extract_decl(e: Entity) -> Result<LetStmt> {
     let var = match e.get_children().as_slice() {
         [var] if var.get_kind() == EntityKind::VarDecl => *var,
         kids => {
@@ -545,17 +545,17 @@ fn translate_decl(e: Entity) -> Result<LetStmt> {
         .get_children()
         .into_iter()
         .find(|c| !is_type_ref(*c))
-        .map(translate_expr)
+        .map(extract_expr)
         .transpose()?;
 
     Ok(LetStmt { name, ty, init })
 }
 
-fn translate_expr(e: Entity) -> Result<Expr> {
+fn extract_expr(e: Entity) -> Result<Expr> {
     let e = strip(e);
     match e.get_kind() {
-        EntityKind::CallExpr => Ok(Expr::Call(translate_call(e)?)),
-        EntityKind::DeclRefExpr | EntityKind::MemberRefExpr => translate_ref(e),
+        EntityKind::CallExpr => Ok(Expr::Call(extract_call(e)?)),
+        EntityKind::DeclRefExpr | EntityKind::MemberRefExpr => extract_ref(e),
         EntityKind::UnaryOperator => {
             let operand =
                 e.get_children()
@@ -571,7 +571,7 @@ fn translate_expr(e: Entity) -> Result<Expr> {
             })?;
             Ok(Expr::Unary(UnaryOp {
                 op,
-                operand: Box::new(translate_expr(operand)?),
+                operand: Box::new(extract_expr(operand)?),
             }))
         }
         EntityKind::BinaryOperator => {
@@ -588,18 +588,18 @@ fn translate_expr(e: Entity) -> Result<Expr> {
             })?;
             Ok(Expr::Binary(BinaryOp {
                 op,
-                lhs: Box::new(translate_expr(*lhs)?),
-                rhs: Box::new(translate_expr(*rhs)?),
+                lhs: Box::new(extract_expr(*lhs)?),
+                rhs: Box::new(extract_expr(*rhs)?),
             }))
         }
         EntityKind::IntegerLiteral | EntityKind::StringLiteral | EntityKind::BoolLiteralExpr => {
-            translate_lit(e)
+            extract_lit(e)
         }
         kind => Err(Unsupported::Expr { kind, loc: loc(e) }),
     }
 }
 
-fn translate_call(e: Entity) -> Result<Call> {
+fn extract_call(e: Entity) -> Result<Call> {
     let name = e.get_name().unwrap_or_default();
     let target = e.get_reference().ok_or_else(|| Unsupported::Callee {
         name: name.clone(),
@@ -637,12 +637,12 @@ fn translate_call(e: Entity) -> Result<Call> {
 
     let args = args
         .iter()
-        .map(|a| translate_expr(*a))
+        .map(|a| extract_expr(*a))
         .collect::<Result<Vec<_>>>()?;
     Ok(Call { callee, args })
 }
 
-fn translate_ref(e: Entity) -> Result<Expr> {
+fn extract_ref(e: Entity) -> Result<Expr> {
     let name = e.get_name().unwrap_or_default();
     let target = e.get_reference().ok_or_else(|| Unsupported::Expr {
         kind: e.get_kind(),
@@ -672,7 +672,7 @@ fn translate_ref(e: Entity) -> Result<Expr> {
 /// Literals prefer `clang_Cursor_Evaluate`, which yields typed values and
 /// works inside macro expansions where there are no tokens. It doesn't cover
 /// every literal kind, so plain token text is the fallback.
-fn translate_lit(e: Entity) -> Result<Expr> {
+fn extract_lit(e: Entity) -> Result<Expr> {
     use clang::EvaluationResult::*;
     let malformed = || Unsupported::Malformed {
         what: format!("unreadable {:?}", e.get_kind()),
@@ -731,7 +731,7 @@ pub struct GeneratorImpl {
     pub body: CompoundStmt,
 }
 
-/// Finds a generator's shape and translates its body into the modeled subset.
+/// Finds a generator's shape and extracts its body into the modeled subset.
 /// Everything downstream works on the result, never on clang entities.
 pub fn get_generator_impl(
     generator: &Entity<'_>,
@@ -803,7 +803,7 @@ pub fn get_generator_impl(
             loc: loc(generator),
         })?;
 
-    let body = translate_compound_stmt(body).map_err(|cause| GeneratorError::Body {
+    let body = extract_compound_stmt(body).map_err(|cause| GeneratorError::Body {
         class: class.clone(),
         method: method.clone(),
         cause,

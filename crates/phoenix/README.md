@@ -48,6 +48,9 @@ cargo run -- 'SetPropIRGenerator::tryAttachNativeSetSlot'
 # call graph, following definitions inside the CacheIR sources 3 levels deep
 cargo run -- 'SetPropIRGenerator::tryAttachNativeSetSlot' --calls --depth 3
 
+# the generator lowered into the modeled C++ subset
+cargo run -- 'CompareIRGenerator::tryAttachNumber' --subset
+
 # a different file / compile database
 cargo run -- 'CallIRGenerator::tryAttachArrayPush' --source js/src/jit/CacheIR.cpp --db path/to/compile_commands.json
 ```
