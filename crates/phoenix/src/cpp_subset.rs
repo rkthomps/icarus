@@ -55,6 +55,7 @@ pub struct AssertStmt {
 #[derive(Clone, Debug)]
 pub enum Expr {
     Call(Call),
+    Construct(Construct),
     Unary(UnaryOp),
     Binary(BinaryOp),
     Ref(Ref),
@@ -63,6 +64,20 @@ pub enum Expr {
     /// `this`. Its type is a pointer to the enclosing class, so it usually
     /// appears under a dereference: `*this`.
     This,
+}
+
+/// Construction of an object: `AutoAvailableFloatRegister(*this, FloatReg0)`.
+///
+/// Not a [`Call`]: there is no callee, only a type, and libclang gives a
+/// constructor's `CallExpr` no callee child -- its children are the arguments.
+/// Clang's own AST agrees, modelling this as `CXXConstructExpr`.
+///
+/// Compiler-inserted copies never reach here; [`is_implicit_conversion`] peels
+/// them first.
+#[derive(Clone, Debug)]
+pub struct Construct {
+    pub ty: Type,
+    pub args: Vec<Expr>,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +93,9 @@ pub enum Callee {
     /// A method, with what it was called on: `v.isNumber()` is
     /// `Method { recv: Some(Param("v")), name: "isNumber" }`. `recv` is `None`
     /// for an implicit `this`, as in `trackAttached("..")`.
+    ///
+    /// LIBCLANG: an implicit `this` receiver is absent from the tree, hence the
+    /// `Option` -- clang's own AST has a `CXXThisExpr` there.
     Method {
         recv: Option<Box<Expr>>,
         name: String,
@@ -296,6 +314,9 @@ fn loc(e: Entity) -> Loc {
 
 /// A node that came from a macro has no tokens of its own: its source range
 /// lies inside the expansion, so `tokenize` yields nothing.
+///
+/// LIBCLANG: no `is_in_macro_expansion`, so emptiness of the token range stands
+/// in for it.
 fn is_macro_expansion(e: Entity) -> bool {
     e.get_range()
         .map(|r| r.tokenize().is_empty())
@@ -316,6 +337,8 @@ fn text_at(l: clang::source::Location, len: usize) -> Option<String> {
 
 /// The macro that produced `e`, read from the invocation site. A cursor's
 /// file location is its *expansion* location, i.e. where the macro was written.
+///
+/// LIBCLANG: macro expansions carry no name, so the source text is re-read.
 fn macro_name(e: Entity) -> Option<String> {
     let name: String = text_at(e.get_location()?.get_file_location(), 64)?
         .chars()
@@ -324,10 +347,9 @@ fn macro_name(e: Entity) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// libclang exposes no spelling for `UnaryOperator`, unlike `BinaryOperator`,
-/// so it has to be read from source. Inside a macro expansion there are no
-/// tokens, but the *spelling* location points at the operator as physically
-/// written in the macro definition.
+/// LIBCLANG: `UnaryOperator` carries no spelling (unlike `BinaryOperator`), so
+/// it is read from source -- tokens normally, and inside a macro expansion the
+/// spelling location, which points at the operator in the macro definition.
 fn operator_spelling(e: Entity) -> Option<String> {
     if let Some(tok) = e
         .get_range()
@@ -342,6 +364,9 @@ fn operator_spelling(e: Entity) -> Option<String> {
 /// Peel off the implicit nodes clang inserts: casts (`UnexposedExpr`),
 /// parentheses, implicit copy constructors and conversion operators. Reading
 /// `lhsVal_` costs four such wrappers before reaching the `FieldDecl`.
+///
+/// LIBCLANG: every implicit cast is an anonymous `UnexposedExpr` with no cast
+/// kind, so they are peeled by shape rather than by what they do.
 fn strip(mut e: Entity) -> Entity {
     loop {
         let peel = match e.get_kind() {
@@ -358,6 +383,8 @@ fn strip(mut e: Entity) -> Entity {
 
 /// Whether a constructor or conversion call was inserted by the compiler
 /// rather than written down.
+///
+/// LIBCLANG: nothing marks a node as implicit, so source extent decides.
 ///
 /// Both look the same structurally -- a `CallExpr` resolving to a `Constructor`
 /// with one argument -- so kind alone can't tell `AutoOutputRegister output(*this)`
@@ -482,19 +509,21 @@ pub fn extract_compound_stmt(body: Entity) -> Result<CompoundStmt> {
 fn extract_block(block: Entity) -> Result<CompoundStmt> {
     let mut stmts = Vec::new();
     for child in block.get_children() {
-        stmts.push(extract_stmt(child)?);
+        stmts.extend(extract_stmt(child)?);
     }
     Ok(CompoundStmt { stmts })
 }
 
-fn extract_stmt(e: Entity) -> Result<Stmt> {
+/// One C++ statement can yield several: a `DeclStmt` declaring more than one
+/// variable becomes one [`Stmt::Let`] per declarator.
+fn extract_stmt(e: Entity) -> Result<Vec<Stmt>> {
     if is_macro_expansion(e) {
-        return extract_macro(e);
+        return Ok(vec![extract_macro(e)?]);
     }
 
     match e.get_kind() {
-        EntityKind::IfStmt => Ok(Stmt::If(extract_if(e)?)),
-        EntityKind::DeclStmt => Ok(Stmt::Let(extract_decl(e)?)),
+        EntityKind::IfStmt => Ok(vec![Stmt::If(extract_if(e)?)]),
+        EntityKind::DeclStmt => Ok(extract_decls(e)?.into_iter().map(Stmt::Let).collect()),
         EntityKind::ReturnStmt => {
             let value = match e.get_children().as_slice() {
                 [] => None,
@@ -506,7 +535,7 @@ fn extract_stmt(e: Entity) -> Result<Stmt> {
                     });
                 }
             };
-            Ok(Stmt::Return(ReturnStmt { value }))
+            Ok(vec![Stmt::Return(ReturnStmt { value })])
         }
         // Loops, switches and jumps are outside the subset. Naming them as
         // statements is clearer than letting them fall to the expression path.
@@ -522,7 +551,7 @@ fn extract_stmt(e: Entity) -> Result<Stmt> {
             loc: loc(e),
         }),
         // Anything else in statement position is an expression statement.
-        _ => Ok(Stmt::Expr(extract_expr(e)?)),
+        _ => Ok(vec![Stmt::Expr(extract_expr(e)?)]),
     }
 }
 
@@ -610,6 +639,8 @@ fn assert_cond(do_stmt: Entity) -> Result<Expr> {
 
 /// Descend through the assertion macro's wrappers to the asserted expression.
 ///
+/// LIBCLANG: macros leave no node of their own, so the expansion is walked.
+///
 /// Counting negations doesn't work: the glue contributes an odd number of `!`,
 /// but `MOZ_ASSERT_IF(.., !IsEqualityOp(op_))` starts with a `!` of its own,
 /// and peeling that one inverts the assertion. The discriminator is *where the
@@ -675,39 +706,53 @@ fn extract_branch(e: Entity) -> Result<CompoundStmt> {
         return extract_block(e);
     }
     Ok(CompoundStmt {
-        stmts: vec![extract_stmt(e)?],
+        stmts: extract_stmt(e)?,
     })
 }
 
-fn extract_decl(e: Entity) -> Result<LetStmt> {
-    let var = match e.get_children().as_slice() {
-        [var] if var.get_kind() == EntityKind::VarDecl => *var,
-        kids => {
-            return Err(Unsupported::Malformed {
-                what: format!("declaration of {} entities", kids.len()),
-                loc: loc(e),
-            });
-        }
-    };
+/// One `DeclStmt` can declare several variables: `Label done, ifTrue;`. Each
+/// becomes its own [`LetStmt`], which is exact -- the declarators share a scope
+/// and keep their order, so splitting them changes nothing.
+fn extract_decls(e: Entity) -> Result<Vec<LetStmt>> {
+    let kids = e.get_children();
+    if kids.is_empty() {
+        return Err(Unsupported::Malformed {
+            what: String::from("declaration of nothing"),
+            loc: loc(e),
+        });
+    }
 
-    let name = var.get_name().ok_or_else(|| Unsupported::Malformed {
-        what: String::from("unnamed variable"),
-        loc: loc(var),
-    })?;
-    let ty = extract_type(var)?;
-    let init = var
-        .get_children()
-        .into_iter()
-        .find(|c| !is_type_ref(*c))
-        .map(extract_expr)
-        .transpose()?;
-
-    Ok(LetStmt { name, ty, init })
+    kids.into_iter()
+        .map(|var| {
+            if var.get_kind() != EntityKind::VarDecl {
+                return Err(Unsupported::Stmt {
+                    kind: var.get_kind(),
+                    loc: loc(var),
+                });
+            }
+            let name = var.get_name().ok_or_else(|| Unsupported::Malformed {
+                what: String::from("unnamed variable"),
+                loc: loc(var),
+            })?;
+            let ty = extract_type(var)?;
+            let init = var
+                .get_children()
+                .into_iter()
+                .find(|c| !is_type_ref(*c))
+                .map(extract_expr)
+                .transpose()?;
+            Ok(LetStmt { name, ty, init })
+        })
+        .collect()
 }
 
 fn extract_expr(e: Entity) -> Result<Expr> {
     let e = strip(e);
     match e.get_kind() {
+        // A constructor's `CallExpr` has no callee child, so it must not go
+        // through `extract_call`, which would mistake its first argument for
+        // one.
+        EntityKind::CallExpr if is_construction(e) => Ok(Expr::Construct(extract_construct(e)?)),
         EntityKind::CallExpr => Ok(Expr::Call(extract_call(e)?)),
         EntityKind::ThisExpr => Ok(Expr::This),
         EntityKind::DeclRefExpr | EntityKind::MemberRefExpr => extract_ref(e),
@@ -753,6 +798,31 @@ fn extract_expr(e: Entity) -> Result<Expr> {
         | EntityKind::BoolLiteralExpr => extract_lit(e),
         kind => Err(Unsupported::Expr { kind, loc: loc(e) }),
     }
+}
+
+/// LIBCLANG: construction is flattened into `CallExpr`, so it is identified by
+/// what the call resolves to rather than by node kind (`CXXConstructExpr`).
+fn is_construction(e: Entity) -> bool {
+    e.get_reference().map(|r| r.get_kind()) == Some(EntityKind::Constructor)
+}
+
+fn extract_construct(e: Entity) -> Result<Construct> {
+    let ty = e.get_type().ok_or_else(|| Unsupported::Malformed {
+        what: format!(
+            "construction of `{}` has no type",
+            e.get_name().unwrap_or_default()
+        ),
+        loc: loc(e),
+    })?;
+    Ok(Construct {
+        ty: type_of(ty, e)?,
+        // Every child is an argument; there is no callee to skip.
+        args: e
+            .get_children()
+            .into_iter()
+            .map(extract_expr)
+            .collect::<Result<Vec<_>>>()?,
+    })
 }
 
 fn extract_call(e: Entity) -> Result<Call> {
@@ -867,7 +937,12 @@ fn extract_lit(e: Entity) -> Result<Expr> {
         .collect::<Vec<_>>()
         .join("");
     match e.get_kind() {
-        EntityKind::StringLiteral => Ok(Expr::Lit(Lit::Str(text.trim_matches('"').to_string()))),
+        // LIBCLANG: a `StringLiteral`'s name is its value but its tokens are as
+        // written, so `__FUNCTION__` tokenizes to itself, not the function name.
+        EntityKind::StringLiteral => {
+            let text = e.get_name().unwrap_or(text);
+            Ok(Expr::Lit(Lit::Str(text.trim_matches('"').to_string())))
+        }
         EntityKind::BoolLiteralExpr => match text.as_str() {
             "true" => Ok(Expr::Lit(Lit::Bool(true))),
             "false" => Ok(Expr::Lit(Lit::Bool(false))),
@@ -1155,6 +1230,13 @@ fn fmt_expr(f: &mut fmt::Formatter, expr: &Expr, depth: usize) -> fmt::Result {
                     }
                 }
             }
+            for arg in &c.args {
+                fmt_expr(f, arg, depth + 1)?;
+            }
+            Ok(())
+        }
+        Expr::Construct(c) => {
+            writeln!(f, "Construct `{}`", c.ty.spelled)?;
             for arg in &c.args {
                 fmt_expr(f, arg, depth + 1)?;
             }
