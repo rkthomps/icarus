@@ -1,13 +1,20 @@
 use std::fmt;
 use std::path::Path;
 
-use cachet_lang::ast::{Ident, Path as CachetPath, Spanned};
+use cachet_lang::ast::{
+    BinOper, CompareBinOper, Ident, LogicalBinOper, Path as CachetPath, Spanned,
+};
+use cachet_lang::ast::{NegateKind, VarParamKind};
 use cachet_lang::parser::{
-    Block, Call, CallableItem, Expr, GlobalVarItem, IrItem, Item, LetStmt, LocalVar, Stmt,
+    Arg, BinOperExpr, Block, Call, CallableItem, Expr, GlobalVarItem, IrItem, Item, LetStmt,
+    LocalVar, NegateExpr, Param as CachetParam, RetStmt, Stmt, VarParam,
 };
 use clang::{Clang, Index};
 
-use crate::cpp_subset::{Indirection, Param, RefKind, Type as CppType, walk_block};
+use crate::cpp_subset::{
+    Callee as CppCallee, CompoundStmt as CppCompoundStmt, Expr as CppExpr, FnDef, Indirection,
+    Param, RefKind, Stmt as CppStmt, Type as CppType, walk_block,
+};
 use crate::{
     clang_utils::{find_definition, get_errors, parse_file},
     cpp_subset::{GenDef, Ref, Visit, get_gen_def},
@@ -65,6 +72,10 @@ fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
         (["JS", "Handle"], [inner]) if inner.as_slice() == ["JS", "Value"] => {
             Ok(CachetPath::from_ident("Value"))
         }
+
+        // `JS::Value` itself, however it is spelled at the use site: by value,
+        // or as the `const Value&` a helper takes.
+        (["JS", "Value"], []) => Ok(CachetPath::from_ident("Value")),
 
         // `enum class JSOp` (Opcodes.h) against `enum JSOp` (notes/jsop.cachet).
         // Same name, same role: the bytecode op a generator is attaching for.
@@ -198,6 +209,193 @@ fn create_field_var_items(fields: &[Ref]) -> Result<Vec<Spanned<Item>>, Unhandle
             })))
         })
         .collect()
+}
+
+/// A C++ method to the Cachet function that models it.
+///
+/// Keyed on the receiver's *translated* type, so `lhsVal_.isNumber()` (whose
+/// receiver is a `HandleValue`) and `v.isNumber()` (a `const Value&`) reach the
+/// same entry: both receivers translate to `Value`.
+///
+/// The names do not always match, which is why this is a table and not a rule:
+/// C++ spells it `isBoolean`, the model spells it `isBool`.
+fn translate_method(recv_ty: CachetPath, method: &str) -> Option<CachetPath> {
+    let value = CachetPath::from_ident("Value");
+    let name = match (recv_ty, method) {
+        // `impl Value` in notes/js.cachet.
+        (ty, "isNumber") if ty == value => "isNumber",
+        (ty, "isBoolean") if ty == value => "isBool",
+        (ty, "isNullOrUndefined") if ty == value => "isNullOrUndefined",
+        _ => return None,
+    };
+    // `impl Value { fn isNumber(value: Value) }` is called as
+    // `Value::isNumber(v)`, so the C++ receiver becomes the first argument.
+    Some(recv_ty.nest(Ident::from(name)))
+}
+
+/// A C++ binary operator to Cachet's.
+fn translate_bin_oper(op: &str) -> Option<BinOper> {
+    Some(match op {
+        "||" => BinOper::Logical(LogicalBinOper::Or),
+        "&&" => BinOper::Logical(LogicalBinOper::And),
+        "==" => BinOper::Compare(CompareBinOper::Eq),
+        "!=" => BinOper::Compare(CompareBinOper::Neq),
+        _ => return None,
+    })
+}
+
+/// The declared type of whatever an expression names.
+///
+/// Needed to key [`translate_method`]: only a name carries a type in the
+/// subset, so a receiver that is anything else cannot be looked up.
+fn named_type(expr: &CppExpr) -> Result<&CppType, Unhandled> {
+    match expr {
+        CppExpr::Ref(r) => Ok(&r.ty),
+        _ => Err(Unhandled(String::from("receiver is not a name"))),
+    }
+}
+
+fn translate_expr(expr: &CppExpr) -> Result<Expr, Unhandled> {
+    match expr {
+        CppExpr::Ref(r) => match r.kind {
+            RefKind::Param | RefKind::Local => Ok(Expr::Var(Spanned::internal(
+                CachetPath::from_ident(Ident::from(r.name.clone())),
+            ))),
+            // A field needs the enclosing `ir` to qualify it, as
+            // `CompareIRGenerator::op_`, which an expression alone doesn't know.
+            RefKind::Field => Err(Unhandled(format!("field reference `{}`", r.name))),
+        },
+
+        CppExpr::Call(call) => match &call.callee {
+            CppCallee::Method {
+                recv: Some(recv),
+                name,
+            } => {
+                let recv_ty = translate_type(named_type(recv)?)?;
+                let target = translate_method(recv_ty, name)
+                    .ok_or_else(|| Unhandled(format!("method `{name}`")))?;
+                // The receiver leads, then the C++ arguments.
+                let mut args = vec![Spanned::internal(Arg::Expr(translate_expr(recv)?))];
+                for arg in &call.args {
+                    args.push(Spanned::internal(Arg::Expr(translate_expr(arg)?)));
+                }
+                Ok(Expr::Invoke(Call {
+                    target: Spanned::internal(target),
+                    args: Spanned::internal(args),
+                }))
+            }
+            CppCallee::Method { recv: None, name } => {
+                Err(Unhandled(format!("method `{name}` on an implicit `this`")))
+            }
+            CppCallee::Free(name) => Err(Unhandled(format!("call to `{name}`"))),
+        },
+
+        CppExpr::Unary(unary) => {
+            if unary.op != "!" {
+                return Err(Unhandled(format!("unary `{}`", unary.op)));
+            }
+            Ok(Expr::Negate(Box::new(NegateExpr {
+                kind: Spanned::internal(NegateKind::Logical),
+                expr: Spanned::internal(translate_expr(&unary.operand)?),
+            })))
+        }
+
+        CppExpr::Binary(binary) => {
+            let oper = translate_bin_oper(&binary.op)
+                .ok_or_else(|| Unhandled(format!("binary `{}`", binary.op)))?;
+            Ok(Expr::BinOper(Box::new(BinOperExpr {
+                oper: Spanned::internal(oper),
+                lhs: Spanned::internal(translate_expr(&binary.lhs)?),
+                rhs: Spanned::internal(translate_expr(&binary.rhs)?),
+            })))
+        }
+
+        CppExpr::Construct(c) => Err(Unhandled(format!("construction of `{}`", c.ty.spelled))),
+        CppExpr::EnumConst(e) => Err(Unhandled(format!("enum constant `{}::{}`", e.ty, e.name))),
+        CppExpr::Lit(_) => Err(Unhandled(String::from("literal"))),
+        CppExpr::This => Err(Unhandled(String::from("`this`"))),
+    }
+}
+
+/// One C++ statement can yield several, so this returns a list.
+fn translate_stmt(stmt: &CppStmt) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
+    match stmt {
+        CppStmt::Return(ret) => {
+            let value = ret.value.as_ref().map(translate_expr).transpose()?;
+            Ok(vec![Spanned::internal(Stmt::Ret(RetStmt {
+                value: Spanned::internal(value),
+            }))])
+        }
+        CppStmt::If(_) => Err(Unhandled(String::from("if statement"))),
+        CppStmt::Let(l) => Err(Unhandled(format!("declaration of `{}`", l.name))),
+        CppStmt::Assert(_) => Err(Unhandled(String::from("assertion"))),
+        CppStmt::Expr(_) => Err(Unhandled(String::from("expression statement"))),
+    }
+}
+
+/// A block of statements. Cachet blocks can also end in a bare tail expression;
+/// C++ always returns explicitly, so `value` is always `None`.
+fn translate_block(body: &CppCompoundStmt) -> Result<Block, Unhandled> {
+    let mut stmts = Vec::new();
+    for stmt in &body.stmts {
+        stmts.extend(translate_stmt(stmt)?);
+    }
+    Ok(Block {
+        stmts,
+        value: Spanned::internal(None),
+    })
+}
+
+/// A helper the generators call:
+///
+/// ```text
+/// static bool CanConvertToDoubleForToNumber(const Value& v) {
+///   return v.isNumber() || v.isBoolean() || v.isNullOrUndefined();
+/// }
+/// ```
+///
+/// becomes
+///
+/// ```text
+/// fn CanConvertToDoubleForToNumber(v: Value) -> Bool {
+///   return Value::isNumber(v) || Value::isBool(v) || Value::isNullOrUndefined(v);
+/// }
+/// ```
+///
+/// Translated rather than modelled: it has no entry in [`translate_method`], so
+/// the translation descends into its definition. A helper that *does* have an
+/// entry bottoms out there instead, and never needs translating.
+pub fn translate_fn_def(fn_def: &FnDef) -> Result<CallableItem, Unhandled> {
+    let params = fn_def
+        .params
+        .iter()
+        .map(|param| {
+            let type_ = translate_type(&param.ty)
+                .map_err(|e| Unhandled(format!("parameter `{}`: {}", param.name, e.0)))?;
+            Ok(CachetParam::Var(VarParam {
+                ident: Spanned::internal(Ident::from(param.name.clone())),
+                // C++ passes these by value or by const reference, so nothing
+                // is written back.
+                kind: VarParamKind::In,
+                type_: Spanned::internal(type_),
+            }))
+        })
+        .collect::<Result<Vec<_>, Unhandled>>()?;
+
+    let ret =
+        translate_type(&fn_def.ret).map_err(|e| Unhandled(format!("return type: {}", e.0)))?;
+
+    Ok(CallableItem {
+        // Kept verbatim, as field and local names are.
+        ident: Spanned::internal(Ident::from(fn_def.name.clone())),
+        attrs: Vec::new(),
+        is_unsafe: false,
+        params,
+        // A plain helper emits nothing.
+        emits: None,
+        ret: Some(Spanned::internal(ret)),
+        body: Spanned::internal(Some(translate_block(&fn_def.body)?)),
+    })
 }
 
 /// `tryAttachNumber` becomes `TryAttachNumber`: Cachet spells ops capitalized,

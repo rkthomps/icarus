@@ -301,11 +301,25 @@ fn main() {
 
     match &opt.cmd {
         Cmd::Cachet { out, .. } => {
-            let extracted = phoenix::cpp_subset::get_gen_def(&def)
-                .map_err(|e| e.to_string())
-                .and_then(|g| {
-                    phoenix::cpp_to_cachet::translate_gen_def(g).map_err(|e| e.to_string())
-                });
+            // A method is a stub generator, which becomes an `ir`; a free
+            // function is a helper, which becomes a `fn`.
+            let extracted = if def.get_kind() == EntityKind::FunctionDecl {
+                phoenix::cpp_subset::get_fn_def(&def)
+                    .map_err(|e| e.to_string())
+                    .and_then(|f| {
+                        phoenix::cpp_to_cachet::translate_fn_def(&f).map_err(|e| e.to_string())
+                    })
+                    .map(|callable| {
+                        cachet_lang::parser::Item::Fn(callable).to_string()
+                    })
+            } else {
+                phoenix::cpp_subset::get_gen_def(&def)
+                    .map_err(|e| e.to_string())
+                    .and_then(|g| {
+                        phoenix::cpp_to_cachet::translate_gen_def(g).map_err(|e| e.to_string())
+                    })
+                    .map(|ir| ir.to_string())
+            };
             match extracted {
                 Ok(ir) => write_out(out.as_deref(), &format!("{ir}\n")),
                 Err(e) => {
