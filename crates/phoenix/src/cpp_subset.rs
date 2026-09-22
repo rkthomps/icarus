@@ -191,6 +191,93 @@ pub enum Lit {
     Bool(bool),
 }
 
+/// A read-only traversal of a body. Each method defaults to descending, so an
+/// implementation overrides only the nodes it cares about; an override that
+/// still wants to descend calls the matching `walk_*` itself.
+pub trait Visit {
+    fn visit_block(&mut self, b: &CompoundStmt) {
+        walk_block(self, b);
+    }
+    fn visit_stmt(&mut self, s: &Stmt) {
+        walk_stmt(self, s);
+    }
+    fn visit_expr(&mut self, e: &Expr) {
+        walk_expr(self, e);
+    }
+    fn visit_call(&mut self, c: &Call) {
+        walk_call(self, c);
+    }
+    /// A leaf, so the default does nothing rather than descending.
+    fn visit_ref(&mut self, _r: &Ref) {}
+}
+
+// `?Sized` so a default method can pass its `&mut Self` here: inside a trait,
+// `Self` is not known to be sized (it could be `dyn Visit`).
+
+pub fn walk_block<V: Visit + ?Sized>(v: &mut V, block: &CompoundStmt) {
+    for stmt in &block.stmts {
+        v.visit_stmt(stmt);
+    }
+}
+
+pub fn walk_stmt<V: Visit + ?Sized>(v: &mut V, stmt: &Stmt) {
+    match stmt {
+        Stmt::If(s) => {
+            v.visit_expr(&s.cond);
+            v.visit_block(&s.then);
+            if let Some(els) = &s.els {
+                v.visit_block(els);
+            }
+        }
+        Stmt::Let(s) => {
+            if let Some(init) = &s.init {
+                v.visit_expr(init);
+            }
+        }
+        Stmt::Return(s) => {
+            if let Some(value) = &s.value {
+                v.visit_expr(value);
+            }
+        }
+        Stmt::Assert(s) => {
+            if let Some(guard) = &s.guard {
+                v.visit_expr(guard);
+            }
+            v.visit_expr(&s.cond);
+        }
+        Stmt::Expr(e) => v.visit_expr(e),
+    }
+}
+
+pub fn walk_expr<V: Visit + ?Sized>(v: &mut V, expr: &Expr) {
+    match expr {
+        Expr::Call(c) => v.visit_call(c),
+        Expr::Construct(c) => {
+            for arg in &c.args {
+                v.visit_expr(arg);
+            }
+        }
+        Expr::Unary(u) => v.visit_expr(&u.operand),
+        Expr::Binary(b) => {
+            v.visit_expr(&b.lhs);
+            v.visit_expr(&b.rhs);
+        }
+        Expr::Ref(r) => v.visit_ref(r),
+        // Leaves.
+        Expr::EnumConst(_) | Expr::Lit(_) | Expr::This => {}
+    }
+}
+
+pub fn walk_call<V: Visit + ?Sized>(v: &mut V, call: &Call) {
+    // The receiver is an expression like any other: `v.isNumber()` reads `v`.
+    if let Callee::Method { recv: Some(recv), .. } = &call.callee {
+        v.visit_expr(recv);
+    }
+    for arg in &call.args {
+        v.visit_expr(arg);
+    }
+}
+
 /// Where an unsupported construct was found, for error reporting.
 #[derive(Clone, Debug)]
 pub struct Loc {
@@ -398,12 +485,17 @@ fn is_implicit_conversion(e: Entity) -> bool {
     ) {
         return false;
     }
-    let (Some(outer), Some(child)) = (e.get_range(), e.get_children().first().and_then(|c| c.get_range()))
-    else {
+    let (Some(outer), Some(child)) = (
+        e.get_range(),
+        e.get_children().first().and_then(|c| c.get_range()),
+    ) else {
         return false;
     };
     let extent = |r: clang::source::SourceRange| {
-        let (s, e) = (r.get_start().get_file_location(), r.get_end().get_file_location());
+        let (s, e) = (
+            r.get_start().get_file_location(),
+            r.get_end().get_file_location(),
+        );
         (s.line, s.column, e.line, e.column)
     };
     extent(outer) == extent(child)
@@ -1045,12 +1137,10 @@ pub fn get_gen_def(generator: &Entity<'_>) -> std::result::Result<GenDef, Error>
             loc: loc(generator),
         })?;
 
-    let method = generator
-        .get_name()
-        .ok_or_else(|| Error::Signature {
-            what: String::from("method has no name"),
-            loc: loc(generator),
-        })?;
+    let method = generator.get_name().ok_or_else(|| Error::Signature {
+        what: String::from("method has no name"),
+        loc: loc(generator),
+    })?;
 
     let unit = format!("{class}::{method}");
     let params = extract_params(generator, &unit)?;
@@ -1268,9 +1358,4 @@ fn fmt_expr(f: &mut fmt::Formatter, expr: &Expr, depth: usize) -> fmt::Result {
             Lit::Bool(b) => writeln!(f, "Lit `{b}`"),
         },
     }
-}
-
-fn translate(generator: Entity) -> std::result::Result<Vec<Item>, std::string::String> {
-    let gen_def = get_gen_def(&generator);
-    Err(std::string::String::from("Ni"))
 }
