@@ -1,21 +1,21 @@
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
-use std::path::Path;
 
 use cachet_lang::ast::{
     BinOper, CompareBinOper, Ident, LogicalBinOper, Path as CachetPath, Spanned,
 };
 use cachet_lang::ast::{NegateKind, VarParamKind};
 use cachet_lang::parser::{
-    Arg, BinOperExpr, Block, Call, CallableItem, Comment, Expr, GlobalVarItem, IrItem, Item,
-    LetStmt,
-    LocalVar, NegateExpr, Param as CachetParam, RetStmt, Stmt, VarParam,
+    Arg, BinOperExpr, Block, Call, CallableItem, Comment, ElseClause, Expr, GlobalVarItem,
+    IfStmt as CachetIfStmt, IrItem, Item, LetStmt, LocalVar, Mod, NegateExpr,
+    Param as CachetParam, RetStmt, Stmt, VarParam,
 };
-use clang::{Clang, Index};
+use clang::Entity;
 
 use crate::cpp_subset::{
     Callee as CppCallee, CompoundStmt as CppCompoundStmt, Expr as CppExpr, FnDef, Indirection,
-    Param, RefKind, Span as CppSpan, Spanned as CppSpanned, Stmt as CppStmt, Type as CppType,
-    walk_block,
+    Error as SubsetError, FnId, FnRef, Param, RefKind, Span as CppSpan, Spanned as CppSpanned,
+    Stmt as CppStmt, Type as CppType, get_fn_def, walk_block,
 };
 use crate::{
     clang_utils::{find_definition, get_errors, parse_file},
@@ -236,6 +236,44 @@ fn create_field_var_items(fields: &[Ref]) -> Result<Vec<Spanned<Item>>, Unhandle
         .collect()
 }
 
+/// What kind of C++ is being translated, which decides both where the item
+/// sits and which entities are ambient to it.
+///
+/// An ambient entity is one the unit carries implicitly and translation
+/// reinterprets rather than translates: a generator's `writer` is the CacheIR
+/// sink, its `AttachDecision` is the dispatcher protocol, an instruction's
+/// `masm` and `allocator` are the machine.
+///
+/// The nesting mirrors Cachet's, which is one level deep: `ParentIndex` is a
+/// type or an `ir`, and callables can't nest. Carrying the parent inside the
+/// kind keeps a helper from having one.
+enum Unit {
+    /// An `op` in the generator's own `ir`.
+    StubGenerator { ir: Ident },
+    /// An `op` in `ir CacheIR`, from `CacheIRCompiler::emit*`.
+    #[allow(dead_code)] // until instructions are translated.
+    Instruction { ir: Ident },
+    /// A top-level `fn`. Nothing is ambient.
+    Helper,
+}
+
+impl Unit {
+    /// The path a field qualifies against, or `None` where there's no parent.
+    fn parent(&self) -> Option<CachetPath> {
+        match self {
+            Unit::StubGenerator { ir } | Unit::Instruction { ir } => {
+                Some(CachetPath::from_ident(*ir))
+            }
+            Unit::Helper => None,
+        }
+    }
+}
+
+/// Where the item being translated sits. Flows down; immutable.
+struct Ctx {
+    unit: Unit,
+}
+
 /// A C++ method to the Cachet function that models it.
 ///
 /// Keyed on the receiver's *translated* type, so `lhsVal_.isNumber()` (whose
@@ -256,6 +294,16 @@ fn translate_method(recv_ty: CachetPath, method: &str) -> Option<CachetPath> {
     // `impl Value { fn isNumber(value: Value) }` is called as
     // `Value::isNumber(v)`, so the C++ receiver becomes the first argument.
     Some(recv_ty.nest(Ident::from(name)))
+}
+
+/// A C++ free function to the Cachet function that models it.
+///
+/// A miss means the definition is translated instead. The CacheIR machinery --
+/// stub generators, their helpers, and the instruction semantics in
+/// `CacheIRCompiler` -- is meant to be translated, so entries here are for
+/// engine functions outside it, where translation should stop.
+fn translate_free(_name: &str) -> Option<CachetPath> {
+    None
 }
 
 /// A C++ binary operator to Cachet's.
@@ -296,22 +344,37 @@ fn named_type(expr: &CppSpanned<CppExpr>) -> Result<&CppType, Unhandled> {
 
 /// Errors from a sub-expression already point at the narrowest construct that
 /// failed, so a span is filled in only where none was set.
-fn translate_expr(expr: &CppSpanned<CppExpr>) -> Result<Expr, Unhandled> {
-    translate_expr_value(expr).map_err(|e| match e.span {
+fn translate_expr(
+    ctx: &Ctx,
+    needed: &mut Vec<FnRef>,
+    expr: &CppSpanned<CppExpr>,
+) -> Result<Expr, Unhandled> {
+    translate_expr_value(ctx, needed, expr).map_err(|e| match e.span {
         CppSpan::Unknown => e.at(&expr.span),
         _ => e,
     })
 }
 
-fn translate_expr_value(expr: &CppSpanned<CppExpr>) -> Result<Expr, Unhandled> {
+fn translate_expr_value(
+    ctx: &Ctx,
+    needed: &mut Vec<FnRef>,
+    expr: &CppSpanned<CppExpr>,
+) -> Result<Expr, Unhandled> {
     match &expr.value {
         CppExpr::Ref(r) => match r.kind {
             RefKind::Param | RefKind::Local => Ok(Expr::Var(Spanned::internal(
                 CachetPath::from_ident(Ident::from(r.name.clone())),
             ))),
-            // A field needs the enclosing `ir` to qualify it, as
-            // `CompareIRGenerator::op_`, which an expression alone doesn't know.
-            RefKind::Field => Err(Unhandled::new(format!("field reference `{}`", r.name))),
+            // A field is a `var` on the enclosing item, and Cachet requires it
+            // qualified: `field` alone doesn't resolve inside an `op`.
+            RefKind::Field => {
+                let parent = ctx.unit.parent().ok_or_else(|| {
+                    Unhandled::new(format!("field `{}` outside an ir", r.name))
+                })?;
+                Ok(Expr::Var(Spanned::internal(
+                    parent.nest(Ident::from(r.name.clone())),
+                )))
+            }
         },
 
         CppExpr::Call(call) => match &call.callee {
@@ -323,9 +386,13 @@ fn translate_expr_value(expr: &CppSpanned<CppExpr>) -> Result<Expr, Unhandled> {
                 let target = translate_method(recv_ty, &callee.name)
                     .ok_or_else(|| Unhandled::new(format!("method `{}`", callee.name)))?;
                 // The receiver leads, then the C++ arguments.
-                let mut args = vec![Spanned::internal(Arg::Expr(translate_expr(recv)?))];
+                let mut args = vec![Spanned::internal(Arg::Expr(translate_expr(
+                    ctx, needed, recv,
+                )?))];
                 for arg in &call.args {
-                    args.push(Spanned::internal(Arg::Expr(translate_expr(arg)?)));
+                    args.push(Spanned::internal(Arg::Expr(translate_expr(
+                        ctx, needed, arg,
+                    )?)));
                 }
                 Ok(Expr::Invoke(Call {
                     target: Spanned::internal(target),
@@ -337,7 +404,26 @@ fn translate_expr_value(expr: &CppSpanned<CppExpr>) -> Result<Expr, Unhandled> {
                 callee.name
             ))),
             CppCallee::Free(callee) => {
-                Err(Unhandled::new(format!("call to `{}`", callee.name)))
+                // Modelled, or translated: on a miss the C++ definition is
+                // recorded for the caller to translate, and the call is emitted
+                // against its own name.
+                let target = translate_free(&callee.name).unwrap_or_else(|| {
+                    needed.push(callee.clone());
+                    CachetPath::from_ident(Ident::from(callee.name.clone()))
+                });
+                let args = call
+                    .args
+                    .iter()
+                    .map(|arg| {
+                        Ok(Spanned::internal(Arg::Expr(translate_expr(
+                            ctx, needed, arg,
+                        )?)))
+                    })
+                    .collect::<Result<Vec<_>, Unhandled>>()?;
+                Ok(Expr::Invoke(Call {
+                    target: Spanned::internal(target),
+                    args: Spanned::internal(args),
+                }))
             }
         },
 
@@ -346,7 +432,7 @@ fn translate_expr_value(expr: &CppSpanned<CppExpr>) -> Result<Expr, Unhandled> {
                 .ok_or_else(|| Unhandled::new(format!("unary `{}`", unary.op)))?;
             Ok(Expr::Negate(Box::new(NegateExpr {
                 kind: Spanned::internal(kind),
-                expr: Spanned::internal(translate_expr(&unary.operand)?),
+                expr: Spanned::internal(translate_expr(ctx, needed, &unary.operand)?),
             })))
         }
 
@@ -355,8 +441,8 @@ fn translate_expr_value(expr: &CppSpanned<CppExpr>) -> Result<Expr, Unhandled> {
                 .ok_or_else(|| Unhandled::new(format!("binary `{}`", binary.op)))?;
             Ok(Expr::BinOper(Box::new(BinOperExpr {
                 oper: Spanned::internal(oper),
-                lhs: Spanned::internal(translate_expr(&binary.lhs)?),
-                rhs: Spanned::internal(translate_expr(&binary.rhs)?),
+                lhs: Spanned::internal(translate_expr(ctx, needed, &binary.lhs)?),
+                rhs: Spanned::internal(translate_expr(ctx, needed, &binary.rhs)?),
             })))
         }
 
@@ -368,22 +454,51 @@ fn translate_expr_value(expr: &CppSpanned<CppExpr>) -> Result<Expr, Unhandled> {
 }
 
 /// One C++ statement can yield several, so this returns a list.
-fn translate_stmt(stmt: &CppSpanned<CppStmt>) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
-    translate_stmt_values(stmt).map_err(|e| match e.span {
+fn translate_stmt(
+    ctx: &Ctx,
+    needed: &mut Vec<FnRef>,
+    stmt: &CppSpanned<CppStmt>,
+) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
+    translate_stmt_values(ctx, needed, stmt).map_err(|e| match e.span {
         CppSpan::Unknown => e.at(&stmt.span),
         _ => e,
     })
 }
 
-fn translate_stmt_values(stmt: &CppSpanned<CppStmt>) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
+fn translate_stmt_values(
+    ctx: &Ctx,
+    needed: &mut Vec<FnRef>,
+    stmt: &CppSpanned<CppStmt>,
+) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
     match &stmt.value {
         CppStmt::Return(ret) => {
-            let value = ret.value.as_ref().map(translate_expr).transpose()?;
+            // A stub generator returns an `AttachDecision`, which is protocol
+            // with the dispatcher rather than a value: whether it attached is
+            // the dispatcher's business, and `ReturnFromIC` comes from a
+            // `writer.returnFromIC()` call, not from returning `Attach`.
+            let value = match ctx.unit {
+                Unit::StubGenerator { .. } => None,
+                _ => ret
+                    .value
+                    .as_ref()
+                    .map(|v| translate_expr(ctx, needed, v))
+                    .transpose()?,
+            };
             Ok(vec![Spanned::internal(Stmt::Ret(RetStmt {
                 value: Spanned::internal(value),
             }))])
         }
-        CppStmt::If(_) => Err(Unhandled::new(String::from("if statement"))),
+        CppStmt::If(s) => Ok(vec![Spanned::internal(Stmt::If(CachetIfStmt {
+            cond: Spanned::internal(translate_expr(ctx, needed, &s.cond)?),
+            then: translate_block(ctx, needed, &s.then)?,
+            // Our `els` is a block, never another `if`, so an `else if` chain
+            // comes out as nested `else { if .. }`.
+            else_: s
+                .els
+                .as_ref()
+                .map(|els| translate_block(ctx, needed, els).map(ElseClause::Else))
+                .transpose()?,
+        }))]),
         CppStmt::Let(l) => Err(Unhandled::new(format!("declaration of `{}`", l.name))),
         CppStmt::Assert(_) => Err(Unhandled::new(String::from("assertion"))),
         CppStmt::Expr(_) => Err(Unhandled::new(String::from("expression statement"))),
@@ -421,8 +536,11 @@ fn quote(span: &CppSpan) -> Option<String> {
 }
 
 /// An untranslated statement, kept as a comment holding the C++ it stood for.
-fn unhandled_comment(e: &Unhandled) -> Comment {
-    let text = match quote(&e.span) {
+///
+/// The quote spans the whole statement, while the reason names the innermost
+/// construct that failed -- quoting that would cut the statement mid-expression.
+fn unhandled_comment(e: &Unhandled, stmt: &CppSpan) -> Comment {
+    let text = match quote(stmt) {
         Some(cpp) => format!("unhandled {}:\n{cpp}", e.what),
         None => format!("unhandled {}", e.what),
     };
@@ -434,12 +552,18 @@ fn unhandled_comment(e: &Unhandled) -> Comment {
 ///
 /// A statement that can't be translated becomes a comment rather than failing
 /// the whole body.
-fn translate_block(body: &CppCompoundStmt) -> Result<Block, Unhandled> {
+fn translate_block(
+    ctx: &Ctx,
+    needed: &mut Vec<FnRef>,
+    body: &CppCompoundStmt,
+) -> Result<Block, Unhandled> {
     let mut stmts = Vec::new();
     for stmt in &body.stmts {
-        match translate_stmt(stmt) {
+        match translate_stmt(ctx, needed, stmt) {
             Ok(translated) => stmts.extend(translated),
-            Err(e) => stmts.push(Spanned::internal(Stmt::from(unhandled_comment(&e)))),
+            Err(e) => stmts.push(Spanned::internal(Stmt::from(unhandled_comment(
+                &e, &stmt.span,
+            )))),
         }
     }
     Ok(Block {
@@ -467,7 +591,7 @@ fn translate_block(body: &CppCompoundStmt) -> Result<Block, Unhandled> {
 /// Translated rather than modelled: it has no entry in [`translate_method`], so
 /// the translation descends into its definition. A helper that *does* have an
 /// entry bottoms out there instead, and never needs translating.
-pub fn translate_fn_def(fn_def: &FnDef) -> Result<CallableItem, Unhandled> {
+pub fn translate_fn_def(fn_def: &FnDef) -> Result<(CallableItem, Vec<FnRef>), Unhandled> {
     let params = fn_def
         .params
         .iter()
@@ -487,7 +611,18 @@ pub fn translate_fn_def(fn_def: &FnDef) -> Result<CallableItem, Unhandled> {
     let ret =
         translate_type(&fn_def.ret).map_err(|e| Unhandled::new(format!("return type: {}", e.what)))?;
 
-    Ok(CallableItem {
+    // A helper is top-level, so it has no parent to qualify names against.
+    // `needed` is created here and returned: its scope is this one definition.
+    let mut needed = Vec::new();
+    let body = translate_block(
+        &Ctx {
+            unit: Unit::Helper,
+        },
+        &mut needed,
+        &fn_def.body,
+    )?;
+
+    let item = CallableItem {
         // Kept verbatim, as field and local names are.
         ident: Spanned::internal(Ident::from(fn_def.name.clone())),
         attrs: Vec::new(),
@@ -496,8 +631,9 @@ pub fn translate_fn_def(fn_def: &FnDef) -> Result<CallableItem, Unhandled> {
         // A plain helper emits nothing.
         emits: None,
         ret: Some(Spanned::internal(ret)),
-        body: Spanned::internal(Some(translate_block(&fn_def.body)?)),
-    })
+        body: Spanned::internal(Some(body)),
+    };
+    Ok((item, needed))
 }
 
 /// `tryAttachNumber` becomes `TryAttachNumber`: Cachet spells ops capitalized,
@@ -510,11 +646,16 @@ fn op_ident(method: &str) -> String {
     }
 }
 
-/// `op TryAttachNumber() { <preamble> }`.
-fn create_generator_op(gen_def: &GenDef) -> Result<CallableItem, Unhandled> {
+/// `op TryAttachNumber() { <preamble> <body> }`, with the helpers it needs.
+fn create_generator_op(
+    ctx: &Ctx,
+    gen_def: &GenDef,
+) -> Result<(CallableItem, Vec<FnRef>), Unhandled> {
     let preamble = translate_preamble(&gen_def.params)?;
+    let mut needed = Vec::new();
+    let body = translate_block(ctx, &mut needed, &gen_def.body)?;
 
-    Ok(CallableItem {
+    let item = CallableItem {
         ident: Spanned::internal(Ident::from(op_ident(&gen_def.method))),
         attrs: Vec::new(),
         is_unsafe: false,
@@ -527,19 +668,17 @@ fn create_generator_op(gen_def: &GenDef) -> Result<CallableItem, Unhandled> {
         // an op yields nothing.
         ret: None,
         body: Spanned::internal(Some(Block {
-            stmts: preamble
-                .into_iter()
-                .chain(translate_block(&gen_def.body)?.stmts)
-                .collect(),
+            stmts: preamble.into_iter().chain(body.stmts).collect(),
             value: Spanned::internal(None),
         })),
-    })
+    };
+    Ok((item, needed))
 }
 
 /// `CompareIRGenerator::tryAttachNumber` becomes
 /// `ir CompareIRGenerator emits CacheIR { .. }`: the generator class names the
 /// `ir`, and every stub generator emits CacheIR.
-pub fn translate_gen_def(gen_def: GenDef) -> Result<IrItem, Unhandled> {
+pub fn translate_gen_def(gen_def: &GenDef) -> Result<(IrItem, Vec<FnRef>), Unhandled> {
     // `writer` is how the C++ emits, not state the generator holds: each
     // `writer.foo(..)` becomes an `emit`, so the field itself has no
     // counterpart in the `ir` and is dropped before translating the rest.
@@ -548,7 +687,13 @@ pub fn translate_gen_def(gen_def: GenDef) -> Result<IrItem, Unhandled> {
         .filter(|field| field.ty.scope != CACHE_IR_WRITER)
         .collect();
     let var_items = create_field_var_items(&fields)?;
-    let generator_op = Item::Op(create_generator_op(&gen_def)?);
+    let ctx = Ctx {
+        unit: Unit::StubGenerator {
+            ir: Ident::from(gen_def.class.clone()),
+        },
+    };
+    let (op, needed) = create_generator_op(&ctx, gen_def)?;
+    let generator_op = Item::Op(op);
 
     // The `var`s first, then the single `op`, as the hand-written models order
     // them: state before the code that reads it.
@@ -557,11 +702,81 @@ pub fn translate_gen_def(gen_def: GenDef) -> Result<IrItem, Unhandled> {
         .chain([Spanned::internal(generator_op)])
         .collect();
 
-    Ok(IrItem {
-        // Spans are `internal` throughout: these nodes are synthesized, so
-        // there is no Cachet source location to point at.
-        ident: Spanned::internal(Ident::from(gen_def.class)),
-        emits: Some(Spanned::internal(CachetPath::from_ident("CacheIR"))),
-        items,
-    })
+    Ok((
+        IrItem {
+            // Spans are `internal` throughout: these nodes are synthesized, so
+            // there is no Cachet source location to point at.
+            ident: Spanned::internal(Ident::from(gen_def.class.clone())),
+            emits: Some(Spanned::internal(CachetPath::from_ident("CacheIR"))),
+            items,
+        },
+        needed,
+    ))
+}
+
+/// Extraction or translation failed.
+#[derive(Debug)]
+pub enum Error {
+    Extract(SubsetError),
+    Unhandled(Unhandled),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::Extract(e) => write!(f, "{e}"),
+            Error::Unhandled(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<SubsetError> for Error {
+    fn from(e: SubsetError) -> Self {
+        Error::Extract(e)
+    }
+}
+
+impl From<Unhandled> for Error {
+    fn from(e: Unhandled) -> Self {
+        Error::Unhandled(e)
+    }
+}
+
+/// A stub generator and every helper it calls, as one module.
+///
+/// Helpers come first, then the `ir`. Translation drives the descent: a helper
+/// is only translated because emitted code calls it, so a statement that fell
+/// back to a comment pulls nothing in.
+pub fn translate_generator(generator: &Entity<'_>) -> Result<Mod, Error> {
+    let gen_def = get_gen_def(generator)?;
+    let (ir, needed) = translate_gen_def(&gen_def)?;
+
+    // Each definition brings its own callees, so deeper helpers stay resolvable.
+    let mut callees = gen_def.callees;
+    let mut queue: VecDeque<FnRef> = needed.into();
+    let mut seen: HashSet<FnId> = HashSet::new();
+    let mut helpers = Vec::new();
+
+    while let Some(fn_ref) = queue.pop_front() {
+        // Insert before translating, so a cycle terminates instead of looping.
+        if !seen.insert(fn_ref.id.clone()) {
+            continue;
+        }
+        let entity = *callees.get(&fn_ref.id).ok_or_else(|| {
+            Unhandled::new(format!(
+                "`{}` has no definition in this translation unit",
+                fn_ref.name
+            ))
+        })?;
+        let fn_def = get_fn_def(&entity)?;
+        let (item, more) = translate_fn_def(&fn_def)?;
+        helpers.push(Spanned::internal(Item::Fn(item)));
+        callees.extend(fn_def.callees);
+        queue.extend(more);
+    }
+
+    Ok(helpers
+        .into_iter()
+        .chain([Spanned::internal(Item::Ir(ir))])
+        .collect())
 }

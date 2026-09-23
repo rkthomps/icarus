@@ -309,16 +309,16 @@ fn main() {
                     .and_then(|f| {
                         phoenix::cpp_to_cachet::translate_fn_def(&f).map_err(|e| e.to_string())
                     })
-                    .map(|callable| {
+                    // TODO: `needed` names the helpers this one calls; the
+                    // worklist that translates them isn't wired up yet.
+                    .map(|(callable, _needed)| {
                         cachet_lang::parser::Item::Fn(callable).to_string()
                     })
             } else {
-                phoenix::cpp_subset::get_gen_def(&def)
+                // The generator plus every helper it calls.
+                phoenix::cpp_to_cachet::translate_generator(&def)
                     .map_err(|e| e.to_string())
-                    .and_then(|g| {
-                        phoenix::cpp_to_cachet::translate_gen_def(g).map_err(|e| e.to_string())
-                    })
-                    .map(|ir| ir.to_string())
+                    .map(|module| module.to_string())
             };
             match extracted {
                 Ok(ir) => write_out(out.as_deref(), &format!("{ir}\n")),
