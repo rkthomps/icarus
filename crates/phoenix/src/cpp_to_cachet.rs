@@ -13,7 +13,8 @@ use cachet_lang::parser::{
 use clang::Entity;
 
 use crate::cpp_subset::{
-    Callee as CppCallee, CompoundStmt as CppCompoundStmt, Expr as CppExpr, FnDef, Indirection,
+    Call as CppCall, Callee as CppCallee, CompoundStmt as CppCompoundStmt, Expr as CppExpr, FnDef,
+    Indirection,
     Error as SubsetError, FnId, FnRef, Param, RefKind, Span as CppSpan, Spanned as CppSpanned,
     Stmt as CppStmt, Type as CppType, get_fn_def, walk_block,
 };
@@ -115,6 +116,12 @@ fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
         // (notes/cacheir.cachet:143-215).
         (["js", "jit", "ValOperandId"], []) => Ok(CachetPath::from_ident("ValueId")),
 
+        // `struct NumberId <: ValueId` (notes/cacheir.cachet:215).
+        (["js", "jit", "NumberOperandId"], []) => Ok(CachetPath::from_ident("NumberId")),
+
+        // `struct Int32Id <: OperandId` (notes/cacheir.cachet:203).
+        (["js", "jit", "Int32OperandId"], []) => Ok(CachetPath::from_ident("Int32Id")),
+
         // `bool` against Cachet's `Bool`.
         (["bool"], []) => Ok(CachetPath::from_ident("Bool")),
 
@@ -145,6 +152,29 @@ fn get_gen_def_fields(gen_def: &GenDef) -> Vec<Ref> {
 
 /// `js::jit::CacheIRWriter`, the type of a generator's `writer` field.
 const CACHE_IR_WRITER: [&str; 3] = ["js", "jit", "CacheIRWriter"];
+
+/// The writer is how C++ emits CacheIR, which Cachet makes implicit. So a
+/// writer is never a value: it is dropped as an argument and as a parameter,
+/// and a call on it becomes an `emit`.
+fn is_writer(ty: &CppType) -> bool {
+    ty.scope == CACHE_IR_WRITER
+}
+
+/// Whether an expression is the writer itself, for dropping it as an argument.
+fn is_writer_expr(expr: &CppSpanned<CppExpr>) -> bool {
+    matches!(&expr.value, CppExpr::Ref(r) if is_writer(&r.ty))
+}
+
+/// The method name, if this is a call on the writer.
+fn writer_call(call: &CppCall) -> Option<&str> {
+    match &call.callee {
+        CppCallee::Method {
+            recv: Some(recv),
+            callee,
+        } if is_writer_expr(&**recv) => Some(&callee.name),
+        _ => None,
+    }
+}
 
 /// `js::jit::ValOperandId`, a generator's input operand.
 const VAL_OPERAND_ID: [&str; 3] = ["js", "jit", "ValOperandId"];
@@ -287,7 +317,9 @@ fn translate_method(recv_ty: CachetPath, method: &str) -> Option<CachetPath> {
     let name = match (recv_ty, method) {
         // `impl Value` in notes/js.cachet.
         (ty, "isNumber") if ty == value => "isNumber",
+        (ty, "isInt32") if ty == value => "isInt32",
         (ty, "isBoolean") if ty == value => "isBool",
+        (ty, "isNull") if ty == value => "isNull",
         (ty, "isNullOrUndefined") if ty == value => "isNullOrUndefined",
         _ => return None,
     };
@@ -414,6 +446,8 @@ fn translate_expr_value(
                 let args = call
                     .args
                     .iter()
+                    // The writer is ambient in Cachet, so it isn't passed.
+                    .filter(|arg| !is_writer_expr(arg))
                     .map(|arg| {
                         Ok(Spanned::internal(Arg::Expr(translate_expr(
                             ctx, needed, arg,
@@ -499,8 +533,48 @@ fn translate_stmt_values(
                 .map(|els| translate_block(ctx, needed, els).map(ElseClause::Else))
                 .transpose()?,
         }))]),
-        CppStmt::Let(l) => Err(Unhandled::new(format!("declaration of `{}`", l.name))),
+        // Cachet's `let` always binds a value, so a C++ declaration without an
+        // initializer -- `Label done;` -- has no counterpart.
+        CppStmt::Let(l) => {
+            let init = l.init.as_ref().ok_or_else(|| {
+                Unhandled::new(format!("declaration of `{}` without an initializer", l.name))
+            })?;
+            Ok(vec![Spanned::internal(Stmt::Let(LetStmt {
+                lhs: LocalVar {
+                    ident: Spanned::internal(Ident::from(l.name.clone())),
+                    is_mut: false,
+                    // Inferred, as the hand-written models leave it.
+                    type_: None,
+                },
+                rhs: Spanned::internal(translate_expr(ctx, needed, init)?),
+            }))])
+        }
         CppStmt::Assert(_) => Err(Unhandled::new(String::from("assertion"))),
+        // `writer.compareDoubleResult(..)` records a CacheIR op, which Cachet
+        // spells `emit CacheIR::CompareDoubleResult(..)`. The op name is the
+        // method's, capitalized -- both come from the same entry in
+        // CacheIROps.yaml. Arguments carry over unchanged.
+        //
+        // The op's *semantics* live in `CacheIRCompiler::emit<Op>`, which is a
+        // separate unit to translate; the call is not chased into it.
+        CppStmt::Expr(CppExpr::Call(call)) if writer_call(call).is_some() => {
+            let name = writer_call(call).unwrap();
+            let args = call
+                .args
+                .iter()
+                .map(|arg| {
+                    Ok(Spanned::internal(Arg::Expr(translate_expr(
+                        ctx, needed, arg,
+                    )?)))
+                })
+                .collect::<Result<Vec<_>, Unhandled>>()?;
+            Ok(vec![Spanned::internal(Stmt::Emit(Call {
+                target: Spanned::internal(
+                    CachetPath::from_ident("CacheIR").nest(Ident::from(op_ident(name))),
+                ),
+                args: Spanned::internal(args),
+            }))])
+        }
         CppStmt::Expr(_) => Err(Unhandled::new(String::from("expression statement"))),
     }
 }
@@ -592,9 +666,18 @@ fn translate_block(
 /// the translation descends into its definition. A helper that *does* have an
 /// entry bottoms out there instead, and never needs translating.
 pub fn translate_fn_def(fn_def: &FnDef) -> Result<(CallableItem, Vec<FnRef>), Unhandled> {
+    // Taking a writer is what makes a function emit, so dropping the parameter
+    // is what the `emits` clause replaces.
+    let emits = fn_def
+        .params
+        .iter()
+        .any(|param| is_writer(&param.ty))
+        .then(|| Spanned::internal(CachetPath::from_ident("CacheIR")));
+
     let params = fn_def
         .params
         .iter()
+        .filter(|param| !is_writer(&param.ty))
         .map(|param| {
             let type_ = translate_type(&param.ty)
                 .map_err(|e| Unhandled::new(format!("parameter `{}`: {}", param.name, e.what)))?;
@@ -628,8 +711,7 @@ pub fn translate_fn_def(fn_def: &FnDef) -> Result<(CallableItem, Vec<FnRef>), Un
         attrs: Vec::new(),
         is_unsafe: false,
         params,
-        // A plain helper emits nothing.
-        emits: None,
+        emits,
         ret: Some(Spanned::internal(ret)),
         body: Spanned::internal(Some(body)),
     };
@@ -742,6 +824,26 @@ impl From<Unhandled> for Error {
     }
 }
 
+/// A top-level comment, for recording what didn't translate.
+fn note(text: String) -> Spanned<Item> {
+    Spanned::internal(Item::from(Comment { text }))
+}
+
+/// A helper's C++ signature, using the types as C++ spells them.
+fn cpp_signature(fn_def: &FnDef) -> String {
+    let params: Vec<String> = fn_def
+        .params
+        .iter()
+        .map(|p| format!("{} {}", p.ty.spelled, p.name))
+        .collect();
+    format!(
+        "{} {}({})",
+        fn_def.ret.spelled,
+        fn_def.name,
+        params.join(", ")
+    )
+}
+
 /// A stub generator and every helper it calls, as one module.
 ///
 /// Helpers come first, then the `ir`. Translation drives the descent: a helper
@@ -762,17 +864,35 @@ pub fn translate_generator(generator: &Entity<'_>) -> Result<Mod, Error> {
         if !seen.insert(fn_ref.id.clone()) {
             continue;
         }
-        let entity = *callees.get(&fn_ref.id).ok_or_else(|| {
-            Unhandled::new(format!(
+
+        // A helper that can't be translated becomes a note rather than failing
+        // the module: the generator is still worth seeing. What it leaves behind
+        // is a call to a name nothing defines, which the comment accounts for.
+        let Some(entity) = callees.get(&fn_ref.id).copied() else {
+            helpers.push(note(format!(
                 "`{}` has no definition in this translation unit",
                 fn_ref.name
-            ))
-        })?;
-        let fn_def = get_fn_def(&entity)?;
-        let (item, more) = translate_fn_def(&fn_def)?;
-        helpers.push(Spanned::internal(Item::Fn(item)));
-        callees.extend(fn_def.callees);
-        queue.extend(more);
+            )));
+            continue;
+        };
+        let fn_def = match get_fn_def(&entity) {
+            Ok(fn_def) => fn_def,
+            Err(e) => {
+                helpers.push(note(format!("cannot extract `{}`: {e}", fn_ref.name)));
+                continue;
+            }
+        };
+        match translate_fn_def(&fn_def) {
+            Ok((item, more)) => {
+                helpers.push(Spanned::internal(Item::Fn(item)));
+                callees.extend(fn_def.callees);
+                queue.extend(more);
+            }
+            Err(e) => helpers.push(note(format!(
+                "cannot translate:\n{}\n{e}",
+                cpp_signature(&fn_def)
+            ))),
+        }
     }
 
     Ok(helpers

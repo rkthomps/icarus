@@ -259,6 +259,11 @@ impl CallableItem {
         fmt_join(f, ", ", self.params.iter())?;
         write!(f, ")")?;
 
+        // Between the parameters and the return type, as the grammar has it.
+        if let Some(emits) = &self.emits {
+            write!(f, " emits {emits}")?;
+        }
+
         if let Some(ret) = &self.ret {
             write!(f, " -> {ret}")?;
         }
