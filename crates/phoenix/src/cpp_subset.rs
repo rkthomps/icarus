@@ -1,5 +1,6 @@
 use cachet_lang::parser::Item;
 use clang::{Entity, EntityKind, TypeKind};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -131,19 +132,31 @@ pub struct Call {
     pub args: Vec<Spanned<Expr>>,
 }
 
+/// clang's Unified Symbol Resolution. Separates overloads, and encodes the file
+/// for a `static`, so same-named statics don't collide.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct FnId(pub String);
+
+/// What a call resolved to. `name` keys a translation table, `id` finds the
+/// definition in [`Callees`].
+#[derive(Clone, Debug)]
+pub struct FnRef {
+    pub name: String,
+    pub id: FnId,
+}
+
 #[derive(Clone, Debug)]
 pub enum Callee {
     /// A free function, e.g. `EmitGuardToDoubleForToNumber`.
-    Free(String),
-    /// A method, with what it was called on: `v.isNumber()` is
-    /// `Method { recv: Some(Param("v")), name: "isNumber" }`. `recv` is `None`
-    /// for an implicit `this`, as in `trackAttached("..")`.
+    Free(FnRef),
+    /// A method, with what it was called on. `recv` is `None` for an implicit
+    /// `this`, as in `trackAttached("..")`.
     ///
     /// LIBCLANG: an implicit `this` receiver is absent from the tree, hence the
     /// `Option` -- clang's own AST has a `CXXThisExpr` there.
     Method {
         recv: Option<Box<Spanned<Expr>>>,
-        name: String,
+        callee: FnRef,
     },
 }
 
@@ -1006,12 +1019,45 @@ fn extract_construct(e: Entity) -> Result<Construct> {
     })
 }
 
+fn fn_id(decl: Entity) -> Option<FnId> {
+    decl.get_usr().map(|usr| FnId(usr.0))
+}
+
+/// Definitions of the functions a body calls, by id.
+///
+/// Absence means no definition in this translation unit, so the caller has to
+/// model it rather than descend. What to descend into is not decided here.
+pub type Callees<'tu> = HashMap<FnId, Entity<'tu>>;
+
+/// Every call in a body, paired with its definition where there is one.
+fn collect_callees<'tu>(body: Entity<'tu>) -> Callees<'tu> {
+    let mut callees = Callees::new();
+    body.visit_children(|e, _| {
+        if e.get_kind() == EntityKind::CallExpr {
+            if let Some(target) = e.get_reference() {
+                if let (Some(id), Some(def)) = (fn_id(target), target.get_definition()) {
+                    callees.insert(id, def);
+                }
+            }
+        }
+        clang::EntityVisitResult::Recurse
+    });
+    callees
+}
+
 fn extract_call(e: Entity) -> Result<Call> {
     let name = e.get_name().unwrap_or_default();
     let target = e.get_reference().ok_or_else(|| Unsupported::Callee {
         name: name.clone(),
         loc: loc(e),
     })?;
+    let fn_ref = FnRef {
+        name: name.clone(),
+        id: fn_id(target).ok_or_else(|| Unsupported::Callee {
+            name: name.clone(),
+            loc: loc(e),
+        })?,
+    };
 
     let kids = e.get_children();
     let (callee_expr, args) = kids.split_first().ok_or_else(|| Unsupported::Malformed {
@@ -1020,7 +1066,7 @@ fn extract_call(e: Entity) -> Result<Call> {
     })?;
 
     let callee = match target.get_kind() {
-        EntityKind::FunctionDecl | EntityKind::FunctionTemplate => Callee::Free(name),
+        EntityKind::FunctionDecl | EntityKind::FunctionTemplate => Callee::Free(fn_ref),
         EntityKind::Method => {
             // For `v.isNumber()` the callee is a `MemberRefExpr` whose own
             // child is the receiver. An implicit `this` leaves it childless.
@@ -1031,7 +1077,10 @@ fn extract_call(e: Entity) -> Result<Call> {
                 .map(extract_expr)
                 .transpose()?
                 .map(Box::new);
-            Callee::Method { recv, name }
+            Callee::Method {
+                recv,
+                callee: fn_ref,
+            }
         }
         _ => return Err(Unsupported::Callee { name, loc: loc(e) }),
     };
@@ -1188,16 +1237,17 @@ fn extract_body(def: Entity, unit: &str) -> std::result::Result<CompoundStmt, Er
 
 /// A stub generator: a method definition on a `*IRGenerator` class.
 #[derive(Clone, Debug)]
-pub struct GenDef {
+pub struct GenDef<'tu> {
     pub class: String,
     pub method: String,
     pub params: Vec<Param>,
     pub body: CompoundStmt,
+    pub callees: Callees<'tu>,
 }
 
 /// Finds a generator's shape and extracts its body into the modeled subset.
 /// Everything downstream works on the result, never on clang entities.
-pub fn get_gen_def(generator: &Entity<'_>) -> std::result::Result<GenDef, Error> {
+pub fn get_gen_def<'tu>(generator: &Entity<'tu>) -> std::result::Result<GenDef<'tu>, Error> {
     let generator = *generator;
 
     if generator.get_kind() != EntityKind::Method {
@@ -1240,23 +1290,25 @@ pub fn get_gen_def(generator: &Entity<'_>) -> std::result::Result<GenDef, Error>
         method,
         params,
         body,
+        callees: collect_callees(generator),
     })
 }
 
 /// A free function defined in the CacheIR sources, e.g.
 /// `CanConvertToDoubleForToNumber` or `EmitGuardToDoubleForToNumber`.
 #[derive(Clone, Debug)]
-pub struct FnDef {
+pub struct FnDef<'tu> {
     pub name: String,
     pub params: Vec<Param>,
     pub ret: Type,
     pub body: CompoundStmt,
+    pub callees: Callees<'tu>,
 }
 
 /// Extracts a free function's definition into the modeled subset. Unlike a
 /// generator it has no owning class, and its return type is explicit rather
 /// than always `AttachDecision`.
-pub fn get_fn_def(function: &Entity<'_>) -> std::result::Result<FnDef, Error> {
+pub fn get_fn_def<'tu>(function: &Entity<'tu>) -> std::result::Result<FnDef<'tu>, Error> {
     let function = *function;
 
     if function.get_kind() != EntityKind::FunctionDecl {
@@ -1294,6 +1346,7 @@ pub fn get_fn_def(function: &Entity<'_>) -> std::result::Result<FnDef, Error> {
         params,
         ret,
         body,
+        callees: collect_callees(function),
     })
 }
 
@@ -1307,7 +1360,7 @@ fn indent(f: &mut fmt::Formatter, depth: usize) -> fmt::Result {
     write!(f, "{:indent$}", "", indent = depth * 2)
 }
 
-impl fmt::Display for GenDef {
+impl fmt::Display for GenDef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "Method `{}` [{}]", self.method, self.class)?;
         for p in &self.params {
@@ -1317,7 +1370,7 @@ impl fmt::Display for GenDef {
     }
 }
 
-impl fmt::Display for FnDef {
+impl fmt::Display for FnDef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "Function `{}` -> {}", self.name, self.ret.spelled)?;
         for p in &self.params {
@@ -1397,9 +1450,9 @@ fn fmt_expr(f: &mut fmt::Formatter, expr: &Expr, depth: usize) -> fmt::Result {
     match expr {
         Expr::Call(c) => {
             match &c.callee {
-                Callee::Free(name) => writeln!(f, "Call Free `{name}`")?,
-                Callee::Method { recv, name } => {
-                    writeln!(f, "Call Method `{name}`")?;
+                Callee::Free(callee) => writeln!(f, "Call Free `{}`", callee.name)?,
+                Callee::Method { recv, callee } => {
+                    writeln!(f, "Call Method `{}`", callee.name)?;
                     // The receiver is printed first, labelled, so it can't be
                     // mistaken for an argument.
                     if let Some(recv) = recv {

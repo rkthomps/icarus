@@ -6,7 +6,8 @@ use cachet_lang::ast::{
 };
 use cachet_lang::ast::{NegateKind, VarParamKind};
 use cachet_lang::parser::{
-    Arg, BinOperExpr, Block, Call, CallableItem, Expr, GlobalVarItem, IrItem, Item, LetStmt,
+    Arg, BinOperExpr, Block, Call, CallableItem, Comment, Expr, GlobalVarItem, IrItem, Item,
+    LetStmt,
     LocalVar, NegateExpr, Param as CachetParam, RetStmt, Stmt, VarParam,
 };
 use clang::{Clang, Index};
@@ -316,11 +317,11 @@ fn translate_expr_value(expr: &CppSpanned<CppExpr>) -> Result<Expr, Unhandled> {
         CppExpr::Call(call) => match &call.callee {
             CppCallee::Method {
                 recv: Some(recv),
-                name,
+                callee,
             } => {
                 let recv_ty = translate_type(named_type(recv)?)?;
-                let target = translate_method(recv_ty, name)
-                    .ok_or_else(|| Unhandled::new(format!("method `{name}`")))?;
+                let target = translate_method(recv_ty, &callee.name)
+                    .ok_or_else(|| Unhandled::new(format!("method `{}`", callee.name)))?;
                 // The receiver leads, then the C++ arguments.
                 let mut args = vec![Spanned::internal(Arg::Expr(translate_expr(recv)?))];
                 for arg in &call.args {
@@ -331,10 +332,13 @@ fn translate_expr_value(expr: &CppSpanned<CppExpr>) -> Result<Expr, Unhandled> {
                     args: Spanned::internal(args),
                 }))
             }
-            CppCallee::Method { recv: None, name } => {
-                Err(Unhandled::new(format!("method `{name}` on an implicit `this`")))
+            CppCallee::Method { recv: None, callee } => Err(Unhandled::new(format!(
+                "method `{}` on an implicit `this`",
+                callee.name
+            ))),
+            CppCallee::Free(callee) => {
+                Err(Unhandled::new(format!("call to `{}`", callee.name)))
             }
-            CppCallee::Free(name) => Err(Unhandled::new(format!("call to `{name}`"))),
         },
 
         CppExpr::Unary(unary) => {
@@ -386,12 +390,57 @@ fn translate_stmt_values(stmt: &CppSpanned<CppStmt>) -> Result<Vec<Spanned<Stmt>
     }
 }
 
+/// The C++ lines a span covers.
+///
+/// Whole lines rather than an exact slice: a clang range ends at the *start* of
+/// its last token, so `[start.offset, end.offset)` would cut it short.
+fn quote(span: &CppSpan) -> Option<String> {
+    let CppSpan::Known { file, start, end } = span else {
+        return None;
+    };
+    let text = std::fs::read_to_string(file).ok()?;
+    let lines: Vec<&str> = text
+        .lines()
+        .skip(start.line.checked_sub(1)? as usize)
+        .take((end.line.checked_sub(start.line)? + 1) as usize)
+        .collect();
+    // Drop the common indentation, which is the C++ nesting, not the statement's.
+    let indent = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    Some(
+        lines
+            .iter()
+            .map(|l| l.get(indent..).unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// An untranslated statement, kept as a comment holding the C++ it stood for.
+fn unhandled_comment(e: &Unhandled) -> Comment {
+    let text = match quote(&e.span) {
+        Some(cpp) => format!("unhandled {}:\n{cpp}", e.what),
+        None => format!("unhandled {}", e.what),
+    };
+    Comment { text }
+}
+
 /// A block of statements. Cachet blocks can also end in a bare tail expression;
 /// C++ always returns explicitly, so `value` is always `None`.
+///
+/// A statement that can't be translated becomes a comment rather than failing
+/// the whole body.
 fn translate_block(body: &CppCompoundStmt) -> Result<Block, Unhandled> {
     let mut stmts = Vec::new();
     for stmt in &body.stmts {
-        stmts.extend(translate_stmt(stmt)?);
+        match translate_stmt(stmt) {
+            Ok(translated) => stmts.extend(translated),
+            Err(e) => stmts.push(Spanned::internal(Stmt::from(unhandled_comment(&e)))),
+        }
     }
     Ok(Block {
         stmts,
@@ -478,8 +527,10 @@ fn create_generator_op(gen_def: &GenDef) -> Result<CallableItem, Unhandled> {
         // an op yields nothing.
         ret: None,
         body: Spanned::internal(Some(Block {
-            // TODO: the translated `gen_def.body`, after the preamble.
-            stmts: preamble,
+            stmts: preamble
+                .into_iter()
+                .chain(translate_block(&gen_def.body)?.stmts)
+                .collect(),
             value: Spanned::internal(None),
         })),
     })
