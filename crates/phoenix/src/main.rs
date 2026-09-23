@@ -2,7 +2,10 @@
 //!
 //! Usage:
 //!   phoenix <Class::method> [--db compile_commands.json] [--source file.cpp]
-//!           [--calls] [--depth N]
+//!           [--calls] [--depth N] [--subset]
+//!
+//! `--subset` dumps the generator lowered into the modeled C++ subset
+//! (`cpp_subset::GenDef`) instead of the raw clang AST.
 //!
 //! `--db` defaults to the compile database that build.rs generated, and
 //! `--source` to js/src/jit/CacheIR.cpp.
@@ -18,141 +21,9 @@
 //! the same self-consistent toolchain. Set `LIBCLANG_PATH` to override.
 
 use clang::{Clang, Entity, EntityKind, Index};
-use serde::Deserialize;
+use clap::{Parser, Subcommand};
+use phoenix::clang_utils::{find_definition, get_errors, parse_file, qualified_name};
 use std::path::{Path, PathBuf};
-
-#[derive(Deserialize)]
-struct CompileCommand {
-    directory: PathBuf,
-    file: PathBuf,
-    command: String,
-}
-
-/// Find the compile command for `source` and turn it into a flag list libclang
-/// will accept: drop the compiler binary, output/dep-file options and the input.
-fn compile_args(db: &Path, source: &Path) -> (PathBuf, PathBuf, Vec<String>) {
-    let text = std::fs::read_to_string(db).expect("read compile_commands.json");
-    let entries: Vec<CompileCommand> = serde_json::from_str(&text).expect("parse compile db");
-    let entry = entries
-        .into_iter()
-        .find(|e| e.file.ends_with(source) || e.file == source)
-        .unwrap_or_else(|| panic!("no compile command for {}", source.display()));
-
-    let words = shlex::split(&entry.command).expect("shlex compile command");
-    let mut args = Vec::new();
-    let mut skip_next = false;
-    for (i, w) in words.iter().enumerate() {
-        if i == 0 || skip_next {
-            skip_next = false;
-            continue;
-        }
-        match w.as_str() {
-            "-o" | "-MF" | "-MT" | "-MQ" => skip_next = true,
-            "-c" | "-MD" | "-MP" | "-MMD" => {}
-            w if w.ends_with(".cpp") || w.ends_with(".cc") => {}
-            w if w.starts_with("-Werror") => {}
-            _ => args.push(w.clone()),
-        }
-    }
-    // libclang doesn't run the driver's language inference; be explicit.
-    args.splice(0..0, ["-x".to_string(), "c++".to_string()]);
-    // Unlike the `clang++` driver, libclang doesn't know where its own
-    // toolchain lives, so it neither finds its builtin headers nor the libc++
-    // shipped next to it and falls back to the (possibly newer) SDK libc++.
-    // Point both at the libclang we're actually loading.
-    if let Some(root) = libclang_root() {
-        let libcxx = root.join("include/c++/v1");
-        if libcxx.is_dir() {
-            // Drop the SDK's libc++ entirely, else `#include_next` chains from
-            // our wrappers into its (incompatible) wrappers.
-            args.push("-nostdinc++".into());
-            args.push("-isystem".into());
-            args.push(libcxx.to_string_lossy().into_owned());
-        }
-        if let Some(res) = resource_dir(&root) {
-            args.push(format!("-resource-dir={}", res.display()));
-        }
-    }
-    // Only diagnose real errors; the tree's warning set is noisy and irrelevant here.
-    args.push("-w".into());
-    // Escape hatch for toolchain quirks (e.g. `-v`, `-resource-dir`, `-isystem`).
-    if let Ok(extra) = std::env::var("PHOENIX_CLANG_ARGS") {
-        args.extend(shlex::split(&extra).unwrap_or_default());
-    }
-    (entry.directory, entry.file, args)
-}
-
-/// Default to the vendored clang that `mach bootstrap` installs unless the
-/// caller pointed us elsewhere. clang-sys reads `LIBCLANG_PATH` when loading.
-fn select_libclang() {
-    if std::env::var_os("LIBCLANG_PATH").is_some() {
-        return;
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    let mozbuild = std::env::var_os("MOZBUILD_STATE_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".mozbuild"));
-    let lib = mozbuild.join("clang/lib");
-    if lib.is_dir() {
-        // SAFETY: single-threaded, before any thread is spawned.
-        unsafe { std::env::set_var("LIBCLANG_PATH", &lib) };
-    }
-}
-
-/// Prefix of the LLVM install that `LIBCLANG_PATH` points into:
-/// `<root>/lib/libclang.dylib`.
-fn libclang_root() -> Option<PathBuf> {
-    let lib = std::env::var_os("LIBCLANG_PATH").map(PathBuf::from)?;
-    let lib = if lib.is_file() {
-        lib.parent()?.to_path_buf()
-    } else {
-        lib
-    };
-    let lib = std::fs::canonicalize(lib).ok()?;
-    lib.parent().map(Path::to_path_buf)
-}
-
-/// `<root>/lib/clang/<version>` — the directory holding clang's builtin headers.
-fn resource_dir(root: &Path) -> Option<PathBuf> {
-    let dir = std::fs::read_dir(root.join("lib/clang")).ok()?;
-    let mut versions: Vec<PathBuf> = dir.flatten().map(|e| e.path()).collect();
-    versions.sort();
-    versions.pop()
-}
-
-/// Walk top-level declarations (including those nested in namespaces) looking
-/// for the method *definition* whose qualified name matches.
-fn find_definition<'tu>(root: Entity<'tu>, qualified: &str) -> Option<Entity<'tu>> {
-    let mut found = None;
-    root.visit_children(|e, _| {
-        use clang::EntityVisitResult::*;
-        match e.get_kind() {
-            EntityKind::Namespace => return Recurse,
-            EntityKind::Method | EntityKind::FunctionDecl if e.is_definition() => {
-                if qualified_name(e) == qualified {
-                    found = Some(e);
-                    return Break;
-                }
-            }
-            _ => {}
-        }
-        Continue
-    });
-    found
-}
-
-/// `Class::method` form, ignoring namespaces (they're all `js::jit` here).
-fn qualified_name(e: Entity) -> String {
-    let name = e.get_name().unwrap_or_default();
-    match e.get_semantic_parent() {
-        Some(p) if matches!(p.get_kind(), EntityKind::ClassDecl | EntityKind::StructDecl) => {
-            format!("{}::{}", p.get_name().unwrap_or_default(), name)
-        }
-        _ => name,
-    }
-}
 
 fn dump(e: Entity, depth: usize) {
     let indent = "  ".repeat(depth);
@@ -317,58 +188,102 @@ fn call_graph(f: Entity, depth: usize, max_depth: usize, seen: &mut Vec<String>)
     }
 }
 
+/// Default to the vendored clang that `mach bootstrap` installs unless the
+/// caller pointed us elsewhere. clang-sys reads `LIBCLANG_PATH` when loading.
+fn select_libclang() {
+    if std::env::var_os("LIBCLANG_PATH").is_some() {
+        return;
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let mozbuild = std::env::var_os("MOZBUILD_STATE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".mozbuild"));
+    let lib = mozbuild.join("clang/lib");
+    if lib.is_dir() {
+        // SAFETY: single-threaded, before any thread is spawned.
+        unsafe { std::env::set_var("LIBCLANG_PATH", &lib) };
+    }
+}
+
+/// Every mode needs the same plumbing, so `--db` and `--source` are global.
+#[derive(Parser)]
+#[command(
+    name = "phoenix",
+    about = "Translate a CacheIR stub generator to Cachet, or inspect it on the way."
+)]
+struct Opt {
+    /// Compile database to take the parse flags from. Defaults to the objdir
+    /// build.rs set up.
+    #[arg(long, global = true)]
+    db: Option<PathBuf>,
+
+    /// Source file the symbol is defined in, matched as a path suffix.
+    #[arg(long, global = true, default_value = "js/src/jit/CacheIR.cpp")]
+    source: PathBuf,
+
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Translate to Cachet.
+    Cachet {
+        /// `Class::method`, or a bare function name.
+        symbol: String,
+        /// Write here instead of standard output.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Dump the generator lowered into the modeled C++ subset.
+    Subset { symbol: String },
+    /// Dump the raw, fully type-resolved clang AST.
+    Ast { symbol: String },
+    /// Dump the call graph, following definitions inside the CacheIR sources.
+    Calls {
+        symbol: String,
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+    },
+}
+
+impl Cmd {
+    fn symbol(&self) -> &str {
+        match self {
+            Cmd::Cachet { symbol, .. }
+            | Cmd::Subset { symbol }
+            | Cmd::Ast { symbol }
+            | Cmd::Calls { symbol, .. } => symbol,
+        }
+    }
+}
+
 fn main() {
-    // phoenix <Class::method> [--db compile_commands.json] [--source file.cpp]
-    //         [--calls] [--depth N]
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let mut take_flag = |name: &str| -> bool {
-        args.iter()
-            .position(|a| a == name)
-            .map(|i| args.remove(i))
-            .is_some()
-    };
-    let calls = take_flag("--calls");
-    let mut take_opt = |name: &str| -> Option<String> {
-        let i = args.iter().position(|a| a == name)?;
-        args.remove(i);
-        Some(args.remove(i))
-    };
-    let max_depth = take_opt("--depth")
-        .map(|d| d.parse::<usize>().expect("--depth N"))
-        .unwrap_or(3);
-    let db = take_opt("--db").or_else(|| option_env!("PHOENIX_COMPILE_DB").map(String::from));
-    let source = take_opt("--source").unwrap_or_else(|| "js/src/jit/CacheIR.cpp".into());
-    let (Some(db), [wanted]) = (db, args.as_slice()) else {
+    let opt = Opt::parse();
+    let symbol = opt.cmd.symbol();
+
+    let Some(db) = opt
+        .db
+        .clone()
+        .or_else(|| option_env!("PHOENIX_COMPILE_DB").map(PathBuf::from))
+    else {
         eprintln!(
-            "usage: phoenix <Class::method> [--db compile_commands.json] [--source file.cpp] [--calls] [--depth N]\n\
-             --db defaults to the objdir build.rs set up ({})",
-            option_env!("PHOENIX_COMPILE_DB").unwrap_or("none; built with PHOENIX_SKIP_SETUP")
+            "no compile database: pass --db, or build with the objdir setup \
+             (this binary was built with PHOENIX_SKIP_SETUP)"
         );
         std::process::exit(2);
     };
-    let db = Path::new(&db);
-    let source = Path::new(&source);
 
     select_libclang();
-    let (dir, source, flags) = compile_args(db, source);
-    std::env::set_current_dir(&dir).expect("chdir to compile directory");
-
     let clang = Clang::new().expect("load libclang");
     let index = Index::new(
         &clang, /* exclude_pch_decls */ false, /* diagnostics */ true,
     );
-    let tu = index
-        .parser(&source)
-        .arguments(&flags)
-        .skip_function_bodies(false)
-        .parse()
-        .expect("parse translation unit");
+    let tu = parse_file(&index, &opt.source, &db);
+    let errors = get_errors(&tu);
 
-    let errors: Vec<_> = tu
-        .get_diagnostics()
-        .into_iter()
-        .filter(|d| d.get_severity() >= clang::diagnostic::Severity::Error)
-        .collect();
     for d in &errors {
         eprintln!("{}", d);
     }
@@ -379,17 +294,82 @@ fn main() {
         );
     }
 
-    let Some(def) = find_definition(tu.get_entity(), wanted) else {
-        eprintln!("definition of {wanted} not found");
+    let Some(def) = find_definition(tu.get_entity(), symbol) else {
+        eprintln!("definition of {symbol} not found");
         std::process::exit(1);
     };
+
+    match &opt.cmd {
+        Cmd::Cachet { out, .. } => {
+            // A method is a stub generator, which becomes an `ir`; a free
+            // function is a helper, which becomes a `fn`.
+            let extracted = if def.get_kind() == EntityKind::FunctionDecl {
+                phoenix::cpp_subset::get_fn_def(&def)
+                    .map_err(|e| e.to_string())
+                    .and_then(|f| {
+                        phoenix::cpp_to_cachet::translate_fn_def(&f).map_err(|e| e.to_string())
+                    })
+                    .map(|callable| {
+                        cachet_lang::parser::Item::Fn(callable).to_string()
+                    })
+            } else {
+                phoenix::cpp_subset::get_gen_def(&def)
+                    .map_err(|e| e.to_string())
+                    .and_then(|g| {
+                        phoenix::cpp_to_cachet::translate_gen_def(g).map_err(|e| e.to_string())
+                    })
+                    .map(|ir| ir.to_string())
+            };
+            match extracted {
+                Ok(ir) => write_out(out.as_deref(), &format!("{ir}\n")),
+                Err(e) => {
+                    eprintln!("cannot translate {symbol}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Cmd::Subset { .. } => {
+            print_location(&def, symbol, &opt.source);
+            // A method is a stub generator; a free function is a helper the
+            // generators call.
+            let extracted = if def.get_kind() == EntityKind::FunctionDecl {
+                phoenix::cpp_subset::get_fn_def(&def).map(|f| f.to_string())
+            } else {
+                phoenix::cpp_subset::get_gen_def(&def).map(|g| g.to_string())
+            };
+            match extracted {
+                Ok(text) => print!("{text}"),
+                Err(e) => {
+                    // `cpp_subset::Error` already names the unit or the location.
+                    eprintln!("cannot extract subset: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Cmd::Ast { .. } => {
+            print_location(&def, symbol, &opt.source);
+            dump(def, 0);
+        }
+        Cmd::Calls { depth, .. } => {
+            print_location(&def, symbol, &opt.source);
+            call_graph(def, 0, *depth, &mut Vec::new());
+        }
+    }
+}
+
+/// The `// <symbol> at <file>:<line>` header the dumps carry. Omitted for
+/// `cachet`, whose output has to stay compilable.
+fn print_location(def: &Entity, symbol: &str, source: &Path) {
     if let Some(loc) = def.get_location() {
         let l = loc.get_file_location();
-        println!("// {wanted} at {}:{}", source.display(), l.line);
+        println!("// {symbol} at {}:{}", source.display(), l.line);
     }
-    if calls {
-        call_graph(def, 0, max_depth, &mut Vec::new());
-    } else {
-        dump(def, 0);
+}
+
+fn write_out(out: Option<&Path>, text: &str) {
+    match out {
+        Some(path) => std::fs::write(path, text)
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display())),
+        None => print!("{text}"),
     }
 }

@@ -41,16 +41,49 @@ upstream, which is why a current mozilla-central is used as the parsing target.
 
 ## Run
 
+Four subcommands, each taking a `Class::method` (or a bare function name).
+Note the `-p phoenix`: the workspace has several binaries, so a bare
+`cargo run --` can't tell which one you mean.
+
 ```sh
-# typed AST
-cargo run -- 'SetPropIRGenerator::tryAttachNativeSetSlot'
+# translate a stub generator to Cachet -- the main path
+cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachNumber'
+
+# ...and write it where the verify scripts look for it
+cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachNumber' \
+  --out notes/stubs/compare-number.cachet
+
+# translate a helper the generators call
+cargo run -p phoenix -- cachet 'CanConvertToDoubleForToNumber'
+
+# the generator lowered into the modeled C++ subset
+cargo run -p phoenix -- subset 'CompareIRGenerator::tryAttachNumber'
+
+# the raw, fully type-resolved clang AST
+cargo run -p phoenix -- ast 'InlinableNativeIRGenerator::tryAttachArrayPush'
 
 # call graph, following definitions inside the CacheIR sources 3 levels deep
-cargo run -- 'SetPropIRGenerator::tryAttachNativeSetSlot' --calls --depth 3
-
-# a different file / compile database
-cargo run -- 'CallIRGenerator::tryAttachArrayPush' --source js/src/jit/CacheIR.cpp --db path/to/compile_commands.json
+cargo run -p phoenix -- calls 'SetPropIRGenerator::tryAttachNativeSetSlot' --depth 3
 ```
+
+`cachet` dispatches on the symbol: a generator method becomes an `ir`, a free
+function becomes a `fn`.
+
+`--source` and `--db` are global and may go before or after the subcommand.
+`--source` is matched as a path suffix against the compile database, and
+defaults to `js/src/jit/CacheIR.cpp`; reach for it when the symbol lives
+elsewhere, such as the machine-code side of an op:
+
+```sh
+cargo run -p phoenix -- subset 'CacheIRCompiler::emitCompareDoubleResult' \
+  --source js/src/jit/CacheIRCompiler.cpp
+
+cargo run -p phoenix -- ast 'CompareIRGenerator::tryAttachNumber' \
+  --db path/to/compile_commands.json
+```
+
+`cargo run -p phoenix -- help` lists the subcommands; `help <subcommand>` shows
+one in detail.
 
 phoenix loads libclang at run time from `~/.mozbuild/clang`, so the parser and
 the compile flags come from the same toolchain. `PHOENIX_CLANG_ARGS` appends

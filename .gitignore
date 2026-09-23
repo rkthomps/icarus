@@ -17,3 +17,6 @@ target/
 
 # SpiderMonkey directory for Phoenix
 mozilla-central/
+
+# Scratch work
+scratch/

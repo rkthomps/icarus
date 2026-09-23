@@ -43,7 +43,7 @@ impl FromIterator<Spanned<Item>> for Mod {
     }
 }
 
-#[derive(Clone, Debug, Display, From)]
+#[derive(Clone, Debug, From)]
 pub enum Item {
     #[from]
     Comment(Comment),
@@ -61,6 +61,24 @@ pub enum Item {
     GlobalVar(GlobalVarItem),
     Fn(CallableItem),
     Op(CallableItem),
+}
+
+impl Display for Item {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match self {
+            Item::Comment(item) => write!(f, "{item}"),
+            Item::Enum(item) => write!(f, "{item}"),
+            Item::Import(item) => write!(f, "{item}"),
+            Item::Struct(item) => write!(f, "{item}"),
+            Item::Ir(item) => write!(f, "{item}"),
+            Item::Impl(item) => write!(f, "{item}"),
+            Item::GlobalVar(item) => write!(f, "{item}"),
+            // The keyword belongs to the variant, not to `CallableItem`, which
+            // is identical for both.
+            Item::Fn(item) => item.fmt_with_keyword(f, "fn"),
+            Item::Op(item) => item.fmt_with_keyword(f, "op"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -226,14 +244,18 @@ pub struct CallableItem {
     pub body: Spanned<Option<Block>>,
 }
 
-impl Display for CallableItem {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+impl CallableItem {
+    /// `fn` and `op` items differ only in that keyword, and which one this is
+    /// lives in the enclosing [`Item`] variant rather than here. The keyword
+    /// can't simply be prepended to this rendering, because attributes and
+    /// `unsafe` come before it.
+    fn fmt_with_keyword(&self, f: &mut fmt::Formatter, keyword: &str) -> Result<(), fmt::Error> {
         fmt_join_trailing(f, "\n", self.attrs.iter())?;
 
         if self.is_unsafe {
             write!(f, "unsafe ")?;
         }
-        write!(f, "op {}(", self.ident)?;
+        write!(f, "{keyword} {}(", self.ident)?;
         fmt_join(f, ", ", self.params.iter())?;
         write!(f, ")")?;
 
