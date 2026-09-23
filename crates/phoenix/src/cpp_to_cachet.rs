@@ -13,7 +13,8 @@ use clang::{Clang, Index};
 
 use crate::cpp_subset::{
     Callee as CppCallee, CompoundStmt as CppCompoundStmt, Expr as CppExpr, FnDef, Indirection,
-    Param, RefKind, Stmt as CppStmt, Type as CppType, walk_block,
+    Param, RefKind, Span as CppSpan, Spanned as CppSpanned, Stmt as CppStmt, Type as CppType,
+    walk_block,
 };
 use crate::{
     clang_utils::{find_definition, get_errors, parse_file},
@@ -25,11 +26,34 @@ use crate::{
 /// Translation refuses rather than guesses: a type mapped wrongly would verify
 /// something other than the code that runs, which is worse than not verifying.
 #[derive(Clone, Debug)]
-pub struct Unhandled(pub String);
+pub struct Unhandled {
+    pub what: String,
+    /// `Unknown` where the construct has no span to point at -- types and
+    /// parameters aren't spanned, only statements and expressions.
+    pub span: CppSpan,
+}
+
+impl Unhandled {
+    fn new(what: impl Into<String>) -> Self {
+        Unhandled {
+            what: what.into(),
+            span: CppSpan::Unknown,
+        }
+    }
+
+    /// Attach a location, for errors raised where one is in scope.
+    fn at(mut self, span: &CppSpan) -> Self {
+        self.span = span.clone();
+        self
+    }
+}
 
 impl fmt::Display for Unhandled {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "unhandled {}", self.0)
+        match &self.span {
+            CppSpan::Unknown => write!(f, "unhandled {}", self.what),
+            span => write!(f, "{span}: unhandled {}", self.what),
+        }
     }
 }
 
@@ -50,7 +74,7 @@ fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
         // A mutable reference or a pointer is aliased state: the callee can
         // write through it, which a Cachet value cannot express.
         Indirection::Ref | Indirection::Ptr => {
-            return Err(Unhandled(format!(
+            return Err(Unhandled::new(format!(
                 "type `{}`: {:?} indirection",
                 ty.spelled, ty.indirection
             )));
@@ -93,7 +117,7 @@ fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
         // `bool` against Cachet's `Bool`.
         (["bool"], []) => Ok(CachetPath::from_ident("Bool")),
 
-        _ => Err(Unhandled(format!(
+        _ => Err(Unhandled::new(format!(
             "type `{}` (canonically `{}`)",
             ty.spelled,
             ty.scope.join("::")
@@ -153,13 +177,13 @@ fn translate_preamble(params: &[Param]) -> Result<Vec<Spanned<Stmt>>, Unhandled>
     // kind would need its own `defineInput*`, and a non-value output would need
     // something other than `initValueOutput`.
     if let Some(other) = params.iter().find(|p| p.ty.scope != VAL_OPERAND_ID) {
-        return Err(Unhandled(format!(
+        return Err(Unhandled::new(format!(
             "parameter `{}`: expected a ValOperandId, found `{}`",
             other.name, other.ty.spelled
         )));
     }
     if params.len() != 2 {
-        return Err(Unhandled(format!(
+        return Err(Unhandled::new(format!(
             "generator takes {} operands, expected 2",
             params.len()
         )));
@@ -199,7 +223,7 @@ fn create_field_var_items(fields: &[Ref]) -> Result<Vec<Spanned<Item>>, Unhandle
         .iter()
         .map(|field| {
             let type_ = translate_type(&field.ty)
-                .map_err(|e| Unhandled(format!("field `{}`: {}", field.name, e.0)))?;
+                .map_err(|e| Unhandled::new(format!("field `{}`: {}", field.name, e.what)))?;
             Ok(Spanned::internal(Item::GlobalVar(GlobalVarItem {
                 ident: Spanned::internal(Ident::from(field.name.clone())),
                 attrs: Vec::new(),
@@ -244,26 +268,49 @@ fn translate_bin_oper(op: &str) -> Option<BinOper> {
     })
 }
 
+/// A C++ unary operator to Cachet's.
+///
+/// Cachet's unary operators are all negations, so `&` and `*` have no
+/// counterpart -- taking an address or dereferencing is aliasing, which a value
+/// language cannot express.
+fn translate_unary_oper(op: &str) -> Option<NegateKind> {
+    Some(match op {
+        "!" => NegateKind::Logical,
+        "-" => NegateKind::Arith,
+        "~" => NegateKind::Bitwise,
+        _ => return None,
+    })
+}
+
 /// The declared type of whatever an expression names.
 ///
 /// Needed to key [`translate_method`]: only a name carries a type in the
 /// subset, so a receiver that is anything else cannot be looked up.
-fn named_type(expr: &CppExpr) -> Result<&CppType, Unhandled> {
-    match expr {
+fn named_type(expr: &CppSpanned<CppExpr>) -> Result<&CppType, Unhandled> {
+    match &expr.value {
         CppExpr::Ref(r) => Ok(&r.ty),
-        _ => Err(Unhandled(String::from("receiver is not a name"))),
+        _ => Err(Unhandled::new(String::from("receiver is not a name"))),
     }
 }
 
-fn translate_expr(expr: &CppExpr) -> Result<Expr, Unhandled> {
-    match expr {
+/// Errors from a sub-expression already point at the narrowest construct that
+/// failed, so a span is filled in only where none was set.
+fn translate_expr(expr: &CppSpanned<CppExpr>) -> Result<Expr, Unhandled> {
+    translate_expr_value(expr).map_err(|e| match e.span {
+        CppSpan::Unknown => e.at(&expr.span),
+        _ => e,
+    })
+}
+
+fn translate_expr_value(expr: &CppSpanned<CppExpr>) -> Result<Expr, Unhandled> {
+    match &expr.value {
         CppExpr::Ref(r) => match r.kind {
             RefKind::Param | RefKind::Local => Ok(Expr::Var(Spanned::internal(
                 CachetPath::from_ident(Ident::from(r.name.clone())),
             ))),
             // A field needs the enclosing `ir` to qualify it, as
             // `CompareIRGenerator::op_`, which an expression alone doesn't know.
-            RefKind::Field => Err(Unhandled(format!("field reference `{}`", r.name))),
+            RefKind::Field => Err(Unhandled::new(format!("field reference `{}`", r.name))),
         },
 
         CppExpr::Call(call) => match &call.callee {
@@ -273,7 +320,7 @@ fn translate_expr(expr: &CppExpr) -> Result<Expr, Unhandled> {
             } => {
                 let recv_ty = translate_type(named_type(recv)?)?;
                 let target = translate_method(recv_ty, name)
-                    .ok_or_else(|| Unhandled(format!("method `{name}`")))?;
+                    .ok_or_else(|| Unhandled::new(format!("method `{name}`")))?;
                 // The receiver leads, then the C++ arguments.
                 let mut args = vec![Spanned::internal(Arg::Expr(translate_expr(recv)?))];
                 for arg in &call.args {
@@ -285,24 +332,23 @@ fn translate_expr(expr: &CppExpr) -> Result<Expr, Unhandled> {
                 }))
             }
             CppCallee::Method { recv: None, name } => {
-                Err(Unhandled(format!("method `{name}` on an implicit `this`")))
+                Err(Unhandled::new(format!("method `{name}` on an implicit `this`")))
             }
-            CppCallee::Free(name) => Err(Unhandled(format!("call to `{name}`"))),
+            CppCallee::Free(name) => Err(Unhandled::new(format!("call to `{name}`"))),
         },
 
         CppExpr::Unary(unary) => {
-            if unary.op != "!" {
-                return Err(Unhandled(format!("unary `{}`", unary.op)));
-            }
+            let kind = translate_unary_oper(&unary.op)
+                .ok_or_else(|| Unhandled::new(format!("unary `{}`", unary.op)))?;
             Ok(Expr::Negate(Box::new(NegateExpr {
-                kind: Spanned::internal(NegateKind::Logical),
+                kind: Spanned::internal(kind),
                 expr: Spanned::internal(translate_expr(&unary.operand)?),
             })))
         }
 
         CppExpr::Binary(binary) => {
             let oper = translate_bin_oper(&binary.op)
-                .ok_or_else(|| Unhandled(format!("binary `{}`", binary.op)))?;
+                .ok_or_else(|| Unhandled::new(format!("binary `{}`", binary.op)))?;
             Ok(Expr::BinOper(Box::new(BinOperExpr {
                 oper: Spanned::internal(oper),
                 lhs: Spanned::internal(translate_expr(&binary.lhs)?),
@@ -310,26 +356,33 @@ fn translate_expr(expr: &CppExpr) -> Result<Expr, Unhandled> {
             })))
         }
 
-        CppExpr::Construct(c) => Err(Unhandled(format!("construction of `{}`", c.ty.spelled))),
-        CppExpr::EnumConst(e) => Err(Unhandled(format!("enum constant `{}::{}`", e.ty, e.name))),
-        CppExpr::Lit(_) => Err(Unhandled(String::from("literal"))),
-        CppExpr::This => Err(Unhandled(String::from("`this`"))),
+        CppExpr::Construct(c) => Err(Unhandled::new(format!("construction of `{}`", c.ty.spelled))),
+        CppExpr::EnumConst(e) => Err(Unhandled::new(format!("enum constant `{}::{}`", e.ty, e.name))),
+        CppExpr::Lit(_) => Err(Unhandled::new(String::from("literal"))),
+        CppExpr::This => Err(Unhandled::new(String::from("`this`"))),
     }
 }
 
 /// One C++ statement can yield several, so this returns a list.
-fn translate_stmt(stmt: &CppStmt) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
-    match stmt {
+fn translate_stmt(stmt: &CppSpanned<CppStmt>) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
+    translate_stmt_values(stmt).map_err(|e| match e.span {
+        CppSpan::Unknown => e.at(&stmt.span),
+        _ => e,
+    })
+}
+
+fn translate_stmt_values(stmt: &CppSpanned<CppStmt>) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
+    match &stmt.value {
         CppStmt::Return(ret) => {
             let value = ret.value.as_ref().map(translate_expr).transpose()?;
             Ok(vec![Spanned::internal(Stmt::Ret(RetStmt {
                 value: Spanned::internal(value),
             }))])
         }
-        CppStmt::If(_) => Err(Unhandled(String::from("if statement"))),
-        CppStmt::Let(l) => Err(Unhandled(format!("declaration of `{}`", l.name))),
-        CppStmt::Assert(_) => Err(Unhandled(String::from("assertion"))),
-        CppStmt::Expr(_) => Err(Unhandled(String::from("expression statement"))),
+        CppStmt::If(_) => Err(Unhandled::new(String::from("if statement"))),
+        CppStmt::Let(l) => Err(Unhandled::new(format!("declaration of `{}`", l.name))),
+        CppStmt::Assert(_) => Err(Unhandled::new(String::from("assertion"))),
+        CppStmt::Expr(_) => Err(Unhandled::new(String::from("expression statement"))),
     }
 }
 
@@ -371,7 +424,7 @@ pub fn translate_fn_def(fn_def: &FnDef) -> Result<CallableItem, Unhandled> {
         .iter()
         .map(|param| {
             let type_ = translate_type(&param.ty)
-                .map_err(|e| Unhandled(format!("parameter `{}`: {}", param.name, e.0)))?;
+                .map_err(|e| Unhandled::new(format!("parameter `{}`: {}", param.name, e.what)))?;
             Ok(CachetParam::Var(VarParam {
                 ident: Spanned::internal(Ident::from(param.name.clone())),
                 // C++ passes these by value or by const reference, so nothing
@@ -383,7 +436,7 @@ pub fn translate_fn_def(fn_def: &FnDef) -> Result<CallableItem, Unhandled> {
         .collect::<Result<Vec<_>, Unhandled>>()?;
 
     let ret =
-        translate_type(&fn_def.ret).map_err(|e| Unhandled(format!("return type: {}", e.0)))?;
+        translate_type(&fn_def.ret).map_err(|e| Unhandled::new(format!("return type: {}", e.what)))?;
 
     Ok(CallableItem {
         // Kept verbatim, as field and local names are.
@@ -460,27 +513,4 @@ pub fn translate_gen_def(gen_def: GenDef) -> Result<IrItem, Unhandled> {
         emits: Some(Spanned::internal(CachetPath::from_ident("CacheIR"))),
         items,
     })
-}
-
-fn to_cachet(
-    index: &Index,
-    gen_path: &Path,
-    db: &Path,
-    gen_name: &String,
-) -> Result<Vec<Item>, String> {
-    let tu = parse_file(index, gen_path, db);
-    let errors = get_errors(&tu);
-    if !errors.is_empty() {
-        return Err(String::from("has errors")); // TODO make better
-    }
-
-    let Some(def) = find_definition(tu.get_entity(), gen_name) else {
-        return Err(String::from("could not find definition")); // TODO make better
-    };
-
-    let Ok(extracted) = get_gen_def(&def) else {
-        return Err(String::from("could not extract def")); // TODO make better
-    };
-
-    Err(String::from("ni"))
 }

@@ -1,6 +1,51 @@
 use cachet_lang::parser::Item;
 use clang::{Entity, EntityKind, TypeKind};
 use std::fmt;
+use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Pos {
+    pub line: u32,
+    pub column: u32,
+    pub offset: u32,
+}
+
+/// Where a node came from, as the half-open region `[start, end)`. `file` is
+/// absolute, so a span outlives the chdir in `parse`.
+#[derive(Clone, Debug)]
+pub enum Span {
+    /// clang reports no range, which happens for some implicit nodes.
+    Unknown,
+    Known {
+        file: PathBuf,
+        start: Pos,
+        end: Pos,
+    },
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Span::Unknown => write!(f, "<unknown>"),
+            Span::Known { file, start, .. } => {
+                let name = file.file_name().unwrap_or(file.as_os_str());
+                write!(f, "{}:{}:{}", name.to_string_lossy(), start.line, start.column)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Spanned<T> {
+    pub span: Span,
+    pub value: T,
+}
+
+impl<T> Spanned<T> {
+    pub fn new(span: Span, value: T) -> Self {
+        Spanned { span, value }
+    }
+}
 
 /// A "small C++": the subset of the clang AST a CacheIR stub generator body
 /// actually uses, with the implicit-conversion scaffolding already stripped.
@@ -8,7 +53,7 @@ use std::fmt;
 /// declaration nodes yet.
 #[derive(Clone, Debug)]
 pub struct CompoundStmt {
-    pub stmts: Vec<Stmt>,
+    pub stmts: Vec<Spanned<Stmt>>,
 }
 
 #[derive(Clone, Debug)]
@@ -26,7 +71,7 @@ pub enum Stmt {
 
 #[derive(Clone, Debug)]
 pub struct IfStmt {
-    pub cond: Expr,
+    pub cond: Spanned<Expr>,
     pub then: CompoundStmt,
     pub els: Option<CompoundStmt>,
 }
@@ -36,20 +81,20 @@ pub struct IfStmt {
 pub struct LetStmt {
     pub name: String,
     pub ty: Type,
-    pub init: Option<Expr>,
+    pub init: Option<Spanned<Expr>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ReturnStmt {
-    pub value: Option<Expr>,
+    pub value: Option<Spanned<Expr>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct AssertStmt {
     /// `MOZ_ASSERT_IF`'s first argument: the assertion holds only where this
     /// does. `None` for a plain `MOZ_ASSERT`.
-    pub guard: Option<Expr>,
-    pub cond: Expr,
+    pub guard: Option<Spanned<Expr>>,
+    pub cond: Spanned<Expr>,
 }
 
 #[derive(Clone, Debug)]
@@ -77,13 +122,13 @@ pub enum Expr {
 #[derive(Clone, Debug)]
 pub struct Construct {
     pub ty: Type,
-    pub args: Vec<Expr>,
+    pub args: Vec<Spanned<Expr>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Call {
     pub callee: Callee,
-    pub args: Vec<Expr>,
+    pub args: Vec<Spanned<Expr>>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,7 +142,7 @@ pub enum Callee {
     /// LIBCLANG: an implicit `this` receiver is absent from the tree, hence the
     /// `Option` -- clang's own AST has a `CXXThisExpr` there.
     Method {
-        recv: Option<Box<Expr>>,
+        recv: Option<Box<Spanned<Expr>>>,
         name: String,
     },
 }
@@ -105,14 +150,14 @@ pub enum Callee {
 #[derive(Clone, Debug)]
 pub struct UnaryOp {
     pub op: String,
-    pub operand: Box<Expr>,
+    pub operand: Box<Spanned<Expr>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BinaryOp {
     pub op: String,
-    pub lhs: Box<Expr>,
-    pub rhs: Box<Expr>,
+    pub lhs: Box<Spanned<Expr>>,
+    pub rhs: Box<Spanned<Expr>>,
 }
 
 /// A name in expression position, resolved to what it refers to.
@@ -216,14 +261,14 @@ pub trait Visit {
 
 pub fn walk_block<V: Visit + ?Sized>(v: &mut V, block: &CompoundStmt) {
     for stmt in &block.stmts {
-        v.visit_stmt(stmt);
+        v.visit_stmt(&stmt.value);
     }
 }
 
 pub fn walk_stmt<V: Visit + ?Sized>(v: &mut V, stmt: &Stmt) {
     match stmt {
         Stmt::If(s) => {
-            v.visit_expr(&s.cond);
+            v.visit_expr(&s.cond.value);
             v.visit_block(&s.then);
             if let Some(els) = &s.els {
                 v.visit_block(els);
@@ -231,19 +276,19 @@ pub fn walk_stmt<V: Visit + ?Sized>(v: &mut V, stmt: &Stmt) {
         }
         Stmt::Let(s) => {
             if let Some(init) = &s.init {
-                v.visit_expr(init);
+                v.visit_expr(&init.value);
             }
         }
         Stmt::Return(s) => {
             if let Some(value) = &s.value {
-                v.visit_expr(value);
+                v.visit_expr(&value.value);
             }
         }
         Stmt::Assert(s) => {
             if let Some(guard) = &s.guard {
-                v.visit_expr(guard);
+                v.visit_expr(&guard.value);
             }
-            v.visit_expr(&s.cond);
+            v.visit_expr(&s.cond.value);
         }
         Stmt::Expr(e) => v.visit_expr(e),
     }
@@ -254,13 +299,13 @@ pub fn walk_expr<V: Visit + ?Sized>(v: &mut V, expr: &Expr) {
         Expr::Call(c) => v.visit_call(c),
         Expr::Construct(c) => {
             for arg in &c.args {
-                v.visit_expr(arg);
+                v.visit_expr(&arg.value);
             }
         }
-        Expr::Unary(u) => v.visit_expr(&u.operand),
+        Expr::Unary(u) => v.visit_expr(&u.operand.value),
         Expr::Binary(b) => {
-            v.visit_expr(&b.lhs);
-            v.visit_expr(&b.rhs);
+            v.visit_expr(&b.lhs.value);
+            v.visit_expr(&b.rhs.value);
         }
         Expr::Ref(r) => v.visit_ref(r),
         // Leaves.
@@ -271,10 +316,10 @@ pub fn walk_expr<V: Visit + ?Sized>(v: &mut V, expr: &Expr) {
 pub fn walk_call<V: Visit + ?Sized>(v: &mut V, call: &Call) {
     // The receiver is an expression like any other: `v.isNumber()` reads `v`.
     if let Callee::Method { recv: Some(recv), .. } = &call.callee {
-        v.visit_expr(recv);
+        v.visit_expr(&recv.value);
     }
     for arg in &call.args {
-        v.visit_expr(arg);
+        v.visit_expr(&arg.value);
     }
 }
 
@@ -378,6 +423,33 @@ impl std::error::Error for Error {
             Error::Signature { .. } => None,
             Error::Body { cause, .. } => Some(cause),
         }
+    }
+}
+
+/// The C++ an entity came from.
+///
+/// The path is canonicalized so it stays meaningful after the process leaves
+/// the compile directory: a compile database records the main file relative to
+/// the build directory, and `parse` chdirs there.
+fn span_of(e: Entity) -> Span {
+    let Some(range) = e.get_range() else {
+        return Span::Unknown;
+    };
+    let start = range.get_start().get_file_location();
+    let end = range.get_end().get_file_location();
+    let Some(file) = start.file.map(|f| f.get_path()) else {
+        return Span::Unknown;
+    };
+
+    let pos = |l: clang::source::Location| Pos {
+        line: l.line,
+        column: l.column,
+        offset: l.offset,
+    };
+    Span::Known {
+        file: std::fs::canonicalize(&file).unwrap_or(file),
+        start: pos(start),
+        end: pos(end),
     }
 }
 
@@ -608,7 +680,18 @@ fn extract_block(block: Entity) -> Result<CompoundStmt> {
 
 /// One C++ statement can yield several: a `DeclStmt` declaring more than one
 /// variable becomes one [`Stmt::Let`] per declarator.
-fn extract_stmt(e: Entity) -> Result<Vec<Stmt>> {
+fn extract_stmt(e: Entity) -> Result<Vec<Spanned<Stmt>>> {
+    // Statements split from one `DeclStmt` share its span; there is no narrower
+    // region to attribute each declarator to.
+    let span = span_of(e);
+    let stmts = extract_stmt_values(e)?;
+    Ok(stmts
+        .into_iter()
+        .map(|stmt| Spanned::new(span.clone(), stmt))
+        .collect())
+}
+
+fn extract_stmt_values(e: Entity) -> Result<Vec<Stmt>> {
     if is_macro_expansion(e) {
         return Ok(vec![extract_macro(e)?]);
     }
@@ -643,7 +726,7 @@ fn extract_stmt(e: Entity) -> Result<Vec<Stmt>> {
             loc: loc(e),
         }),
         // Anything else in statement position is an expression statement.
-        _ => Ok(vec![Stmt::Expr(extract_expr(e)?)]),
+        _ => Ok(vec![Stmt::Expr(extract_expr(e)?.value)]),
     }
 }
 
@@ -709,7 +792,7 @@ fn do_body(e: Entity) -> Result<Vec<Entity>> {
 /// condition is `MOZ_UNLIKELY(!MOZ_CHECK_ASSERT_ASSIGNMENT(expr))`
 /// (`Assertions.h:535`), so the asserted expression sits under a chain of
 /// macro-written negations and parens.
-fn assert_cond(do_stmt: Entity) -> Result<Expr> {
+fn assert_cond(do_stmt: Entity) -> Result<Spanned<Expr>> {
     let if_stmt = do_body(do_stmt)?
         .into_iter()
         .find(|c| c.get_kind() == EntityKind::IfStmt)
@@ -838,8 +921,14 @@ fn extract_decls(e: Entity) -> Result<Vec<LetStmt>> {
         .collect()
 }
 
-fn extract_expr(e: Entity) -> Result<Expr> {
+fn extract_expr(e: Entity) -> Result<Spanned<Expr>> {
+    // The span of the stripped node: the implicit wrappers cover the same text
+    // anyway, and this is the node the value describes.
     let e = strip(e);
+    Ok(Spanned::new(span_of(e), extract_expr_value(e)?))
+}
+
+fn extract_expr_value(e: Entity) -> Result<Expr> {
     match e.get_kind() {
         // A constructor's `CallExpr` has no callee child, so it must not go
         // through `extract_call`, which would mistake its first argument for
@@ -1248,7 +1337,7 @@ fn fmt_block(f: &mut fmt::Formatter, block: &CompoundStmt, depth: usize) -> fmt:
     indent(f, depth)?;
     writeln!(f, "CompoundStmt")?;
     for stmt in &block.stmts {
-        fmt_stmt(f, stmt, depth + 1)?;
+        fmt_stmt(f, &stmt.value, depth + 1)?;
     }
     Ok(())
 }
@@ -1266,7 +1355,7 @@ fn fmt_stmt(f: &mut fmt::Formatter, stmt: &Stmt, depth: usize) -> fmt::Result {
         Stmt::If(s) => {
             indent(f, depth)?;
             writeln!(f, "IfStmt")?;
-            fmt_expr(f, &s.cond, depth + 1)?;
+            fmt_expr(f, &s.cond.value, depth + 1)?;
             fmt_block(f, &s.then, depth + 1)?;
             if let Some(els) = &s.els {
                 indent(f, depth + 1)?;
@@ -1279,7 +1368,7 @@ fn fmt_stmt(f: &mut fmt::Formatter, stmt: &Stmt, depth: usize) -> fmt::Result {
             indent(f, depth)?;
             writeln!(f, "VarDecl `{}` : {}", s.name, s.ty.spelled)?;
             match &s.init {
-                Some(init) => fmt_expr(f, init, depth + 1),
+                Some(init) => fmt_expr(f, &init.value, depth + 1),
                 None => Ok(()),
             }
         }
@@ -1287,7 +1376,7 @@ fn fmt_stmt(f: &mut fmt::Formatter, stmt: &Stmt, depth: usize) -> fmt::Result {
             indent(f, depth)?;
             writeln!(f, "ReturnStmt")?;
             match &s.value {
-                Some(v) => fmt_expr(f, v, depth + 1),
+                Some(v) => fmt_expr(f, &v.value, depth + 1),
                 None => Ok(()),
             }
         }
@@ -1295,9 +1384,9 @@ fn fmt_stmt(f: &mut fmt::Formatter, stmt: &Stmt, depth: usize) -> fmt::Result {
             indent(f, depth)?;
             writeln!(f, "AssertStmt")?;
             if let Some(guard) = &s.guard {
-                fmt_labelled(f, "Guard", guard, depth + 1)?;
+                fmt_labelled(f, "Guard", &guard.value, depth + 1)?;
             }
-            fmt_labelled(f, "Cond", &s.cond, depth + 1)
+            fmt_labelled(f, "Cond", &s.cond.value, depth + 1)
         }
         Stmt::Expr(e) => fmt_expr(f, e, depth),
     }
@@ -1316,30 +1405,30 @@ fn fmt_expr(f: &mut fmt::Formatter, expr: &Expr, depth: usize) -> fmt::Result {
                     if let Some(recv) = recv {
                         indent(f, depth + 1)?;
                         writeln!(f, "Recv")?;
-                        fmt_expr(f, recv, depth + 2)?;
+                        fmt_expr(f, &recv.value, depth + 2)?;
                     }
                 }
             }
             for arg in &c.args {
-                fmt_expr(f, arg, depth + 1)?;
+                fmt_expr(f, &arg.value, depth + 1)?;
             }
             Ok(())
         }
         Expr::Construct(c) => {
             writeln!(f, "Construct `{}`", c.ty.spelled)?;
             for arg in &c.args {
-                fmt_expr(f, arg, depth + 1)?;
+                fmt_expr(f, &arg.value, depth + 1)?;
             }
             Ok(())
         }
         Expr::Unary(u) => {
             writeln!(f, "Unary `{}`", u.op)?;
-            fmt_expr(f, &u.operand, depth + 1)
+            fmt_expr(f, &u.operand.value, depth + 1)
         }
         Expr::Binary(b) => {
             writeln!(f, "Binary `{}`", b.op)?;
-            fmt_expr(f, &b.lhs, depth + 1)?;
-            fmt_expr(f, &b.rhs, depth + 1)
+            fmt_expr(f, &b.lhs.value, depth + 1)?;
+            fmt_expr(f, &b.rhs.value, depth + 1)
         }
         Expr::Ref(r) => {
             let kind = match r.kind {
