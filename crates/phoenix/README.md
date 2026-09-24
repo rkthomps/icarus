@@ -49,9 +49,9 @@ Note the `-p phoenix`: the workspace has several binaries, so a bare
 # translate a stub generator to Cachet -- the main path
 cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachInt32'
 
-# ...and write it where the verify scripts look for it
+# ...and write it to a file, with imports relative to that file
 cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachInt32' \
-  --out notes/stubs/compare-int32.cachet
+  --out out/compare-int32.cachet --imports ../notes
 
 # translate a helper the generators call
 cargo run -p phoenix -- cachet 'CanConvertToInt32ForToNumber'
