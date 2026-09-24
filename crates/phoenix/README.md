@@ -47,17 +47,17 @@ Note the `-p phoenix`: the workspace has several binaries, so a bare
 
 ```sh
 # translate a stub generator to Cachet -- the main path
-cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachNumber'
+cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachInt32'
 
 # ...and write it where the verify scripts look for it
-cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachNumber' \
-  --out notes/stubs/compare-number.cachet
+cargo run -p phoenix -- cachet 'CompareIRGenerator::tryAttachInt32' \
+  --out notes/stubs/compare-int32.cachet
 
 # translate a helper the generators call
-cargo run -p phoenix -- cachet 'CanConvertToDoubleForToNumber'
+cargo run -p phoenix -- cachet 'CanConvertToInt32ForToNumber'
 
 # the generator lowered into the modeled C++ subset
-cargo run -p phoenix -- subset 'CompareIRGenerator::tryAttachNumber'
+cargo run -p phoenix -- subset 'CompareIRGenerator::tryAttachInt32'
 
 # the raw, fully type-resolved clang AST
 cargo run -p phoenix -- ast 'InlinableNativeIRGenerator::tryAttachArrayPush'
@@ -79,7 +79,7 @@ elsewhere, such as the machine-code side of an op:
 cargo run -p phoenix -- subset 'CacheIRCompiler::emitCompareDoubleResult' \
   --source js/src/jit/CacheIRCompiler.cpp
 
-cargo run -p phoenix -- ast 'CompareIRGenerator::tryAttachNumber' \
+cargo run -p phoenix -- ast 'CompareIRGenerator::tryAttachInt32' \
   --db path/to/compile_commands.json
 ```
 
@@ -100,7 +100,7 @@ run says how much translates and how much of that verifies.
 ./scripts/translate-verify.sh 'CompareIRGenerator::tryAttachInt32'
 
 # ...with the compiler and verifier output as it goes
-./scripts/translate-verify.sh -v 'CompareIRGenerator::tryAttachNumber'
+./scripts/translate-verify.sh -v 'CompareIRGenerator::tryAttachInt32'
 ```
 
 Output lands in `out/phoenix/`, which is gitignored: a partial translation is an
