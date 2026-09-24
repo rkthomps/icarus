@@ -7,21 +7,22 @@ use cachet_lang::ast::{
 use cachet_lang::ast::{NegateKind, VarParamKind};
 use cachet_lang::parser::{
     Arg, BinOperExpr, Block, Call, CallableItem, Comment, ElseClause, Expr, GlobalVarItem,
-    IfStmt as CachetIfStmt, IrItem, Item, LetStmt, LocalVar, Mod, NegateExpr,
+    IfStmt as CachetIfStmt, IrItem, Item, LetStmt, Literal, LocalVar, Mod, NegateExpr,
     Param as CachetParam, RetStmt, Stmt, VarParam,
 };
-use clang::Entity;
+use clang::{Entity, EntityKind};
 
+use crate::cacheir_ops::{
+    Op as CacheIrOp, Ops, create_op_wrapper, helper_sig, is_operand_id, op_path, writer_arity,
+    writer_method,
+};
 use crate::cpp_subset::{
-    Call as CppCall, Callee as CppCallee, CompoundStmt as CppCompoundStmt, Expr as CppExpr, FnDef,
-    Indirection,
+    Call as CppCall, Callee as CppCallee, CompoundStmt as CppCompoundStmt,
+    Construct as CppConstruct, Expr as CppExpr, FnDef, Indirection, Lit as CppLit,
     Error as SubsetError, FnId, FnRef, Param, RefKind, Span as CppSpan, Spanned as CppSpanned,
     Stmt as CppStmt, Type as CppType, get_fn_def, walk_block,
 };
-use crate::{
-    clang_utils::{find_definition, get_errors, parse_file},
-    cpp_subset::{GenDef, Ref, Visit, get_gen_def},
-};
+use crate::cpp_subset::{ClassRef, MethodDef, Ref, Visit, get_method_def};
 
 /// A C++ construct with no Cachet counterpart yet.
 ///
@@ -36,7 +37,7 @@ pub struct Unhandled {
 }
 
 impl Unhandled {
-    fn new(what: impl Into<String>) -> Self {
+    pub fn new(what: impl Into<String>) -> Self {
         Unhandled {
             what: what.into(),
             span: CppSpan::Unknown,
@@ -107,20 +108,21 @@ fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
         // Same name, same role: the bytecode op a generator is attaching for.
         (["JSOp"], []) => Ok(CachetPath::from_ident("JSOp")),
 
-        // An input operand holding a value. `CacheIR::defineInputValueId`
-        // returns `ValueId` (notes/cacheir.cachet:459), which is what a
-        // `ValOperandId` denotes on the Cachet side.
-        //
-        // The rest of the `*OperandId` family maps the same way when needed:
-        // `ObjOperandId`/`ObjectId`, `NumberOperandId`/`NumberId`, and so on
-        // (notes/cacheir.cachet:143-215).
+        // The operand id family (notes/cacheir.cachet:89-263). Each names a slot
+        // and the static type that slot carries; the C++ and Cachet spellings
+        // differ only by convention. `CacheIR::defineInputValueId` returns
+        // `ValueId` (:459), which is what a `ValOperandId` denotes.
+        (["js", "jit", "OperandId"], []) => Ok(CachetPath::from_ident("OperandId")),
         (["js", "jit", "ValOperandId"], []) => Ok(CachetPath::from_ident("ValueId")),
-
-        // `struct NumberId <: ValueId` (notes/cacheir.cachet:215).
-        (["js", "jit", "NumberOperandId"], []) => Ok(CachetPath::from_ident("NumberId")),
-
-        // `struct Int32Id <: OperandId` (notes/cacheir.cachet:203).
+        (["js", "jit", "ObjOperandId"], []) => Ok(CachetPath::from_ident("ObjectId")),
+        (["js", "jit", "StringOperandId"], []) => Ok(CachetPath::from_ident("StringId")),
+        (["js", "jit", "SymbolOperandId"], []) => Ok(CachetPath::from_ident("SymbolId")),
+        (["js", "jit", "BooleanOperandId"], []) => Ok(CachetPath::from_ident("BoolId")),
         (["js", "jit", "Int32OperandId"], []) => Ok(CachetPath::from_ident("Int32Id")),
+        (["js", "jit", "NumberOperandId"], []) => Ok(CachetPath::from_ident("NumberId")),
+        (["js", "jit", "BigIntOperandId"], []) => Ok(CachetPath::from_ident("BigIntId")),
+        (["js", "jit", "ValueTagOperandId"], []) => Ok(CachetPath::from_ident("ValueTagId")),
+        (["js", "jit", "IntPtrOperandId"], []) => Ok(CachetPath::from_ident("IntPtrId")),
 
         // `bool` against Cachet's `Bool`.
         (["bool"], []) => Ok(CachetPath::from_ident("Bool")),
@@ -131,6 +133,40 @@ fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
             ty.scope.join("::")
         ))),
     }
+}
+
+/// Something a translated body referred to that still has to be defined.
+///
+/// Two ways to get one: translate the C++ definition, or synthesize it from a
+/// `CacheIROps.yaml` entry. Which it is follows from how the call resolved, so it
+/// is recorded here rather than rediscovered by the worklist.
+#[derive(Clone, Debug)]
+pub enum Needed {
+    /// A C++ definition to translate, found by identity.
+    Cpp(FnRef),
+    /// A wrapper over a CacheIR op, named by the op.
+    Wrapper(String),
+}
+
+/// The op a writer call emits.
+fn resolve_op<'a>(ops: &'a Ops, method: &str) -> Result<&'a CacheIrOp, Unhandled> {
+    ops.by_writer_method(method).ok_or_else(|| {
+        Unhandled::new(format!(
+            "`writer.{method}`: no matching op in CacheIROps.yaml"
+        ))
+    })
+}
+
+/// C++ passes every operand the writer method takes, so a mismatch means the
+/// call isn't the one the yaml describes.
+fn check_arity(op: &CacheIrOp, method: &str, args: usize) -> Result<(), Unhandled> {
+    let expected = writer_arity(op);
+    if args != expected {
+        return Err(Unhandled::new(format!(
+            "`writer.{method}` takes {expected} operands, called with {args}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -144,9 +180,9 @@ impl Visit for Fields {
     }
 }
 
-fn get_gen_def_fields(gen_def: &GenDef) -> Vec<Ref> {
+fn get_method_def_fields(method_def: &MethodDef) -> Vec<Ref> {
     let mut fields = Fields::default();
-    walk_block(&mut fields, &gen_def.body);
+    walk_block(&mut fields, &method_def.def.body);
     fields.0
 }
 
@@ -165,13 +201,15 @@ fn is_writer_expr(expr: &CppSpanned<CppExpr>) -> bool {
     matches!(&expr.value, CppExpr::Ref(r) if is_writer(&r.ty))
 }
 
-/// The method name, if this is a call on the writer.
-fn writer_call(call: &CppCall) -> Option<&str> {
+/// The method, if this is a call on the writer: either through a `writer` field,
+/// or on an implicit `this` inside a `CacheIRWriter` method.
+fn writer_call<'a>(ctx: &Ctx<'_>, call: &'a CppCall) -> Option<&'a FnRef> {
     match &call.callee {
         CppCallee::Method {
             recv: Some(recv),
             callee,
-        } if is_writer_expr(&**recv) => Some(&callee.name),
+        } if is_writer_expr(&**recv) => Some(callee),
+        CppCallee::Method { recv: None, callee } if ctx.recv_is_writer() => Some(callee),
         _ => None,
     }
 }
@@ -266,42 +304,95 @@ fn create_field_var_items(fields: &[Ref]) -> Result<Vec<Spanned<Item>>, Unhandle
         .collect()
 }
 
-/// What kind of C++ is being translated, which decides both where the item
-/// sits and which entities are ambient to it.
+/// `js::jit::CacheIRCompiler`, whose `emit*` methods are the op semantics.
+const CACHE_IR_COMPILER: [&str; 3] = ["js", "jit", "CacheIRCompiler"];
+
+/// The classes in `CacheIRGenerator.h` whose methods are stub generators.
 ///
-/// An ambient entity is one the unit carries implicitly and translation
-/// reinterprets rather than translates: a generator's `writer` is the CacheIR
-/// sink, its `AttachDecision` is the dispatcher protocol, an instruction's
-/// `masm` and `allocator` are the machine.
-///
-/// The nesting mirrors Cachet's, which is one level deep: `ParentIndex` is a
-/// type or an `ir`, and callables can't nest. Carrying the parent inside the
-/// kind keeps a helper from having one.
-enum Unit {
-    /// An `op` in the generator's own `ir`.
-    StubGenerator { ir: Ident },
-    /// An `op` in `ir CacheIR`, from `CacheIRCompiler::emit*`.
-    #[allow(dead_code)] // until instructions are translated.
-    Instruction { ir: Ident },
-    /// A top-level `fn`. Nothing is ambient.
-    Helper,
+/// Enumerated rather than matched on the `IRGenerator` suffix, which would also
+/// catch `LIRGenerator` and `MIRGenerator` -- unrelated Ion classes -- and the
+/// `IRGenerator` base class, whose methods are shared helpers rather than
+/// generators. A class missing from here is refused rather than guessed at, so
+/// an omission shows up as a translation failure and never as a wrong `ir`.
+const STUB_GENERATORS: &[&str] = &[
+    "BinaryArithIRGenerator",
+    "BindNameIRGenerator",
+    "CallIRGenerator",
+    "CheckPrivateFieldIRGenerator",
+    "CloseIterIRGenerator",
+    "CompareIRGenerator",
+    "GetImportIRGenerator",
+    "GetIteratorIRGenerator",
+    "GetNameIRGenerator",
+    "GetPropIRGenerator",
+    "HasPropIRGenerator",
+    "InlinableNativeIRGenerator",
+    "InstanceOfIRGenerator",
+    "LambdaIRGenerator",
+    "LazyConstantIRGenerator",
+    "NewArrayIRGenerator",
+    "NewObjectIRGenerator",
+    "OptimizeGetIteratorIRGenerator",
+    "OptimizeSpreadCallIRGenerator",
+    "SetPropIRGenerator",
+    "ToBoolIRGenerator",
+    "ToPropertyKeyIRGenerator",
+    "TypeOfEqIRGenerator",
+    "TypeOfIRGenerator",
+    "UnaryArithIRGenerator",
+];
+
+/// What is being translated, and the op table its `writer` calls resolve
+/// against. Flows down; immutable.
+struct Ctx<'a> {
+    /// The class the callable is defined on, `None` for a free function.
+    ///
+    /// The class decides what is ambient -- entities the code carries
+    /// implicitly, which translation reinterprets rather than translates. A
+    /// generator's `writer` is the CacheIR sink and its `AttachDecision` is
+    /// protocol with the dispatcher; a `CacheIRWriter` method *is* the writer,
+    /// so its implicit `this` is one; an instruction's `masm` and `allocator`
+    /// are the machine. A free function carries nothing.
+    class: Option<ClassRef>,
+    /// `CacheIROps.yaml`, which decides what a `writer` call becomes.
+    ops: &'a Ops,
 }
 
-impl Unit {
-    /// The path a field qualifies against, or `None` where there's no parent.
-    fn parent(&self) -> Option<CachetPath> {
-        match self {
-            Unit::StubGenerator { ir } | Unit::Instruction { ir } => {
-                Some(CachetPath::from_ident(*ir))
-            }
-            Unit::Helper => None,
-        }
+impl Ctx<'_> {
+    /// Whether `this` is the CacheIR writer, which makes a call on an implicit
+    /// receiver -- `guardToInt32_(input)` inside a wrapper -- a writer call.
+    fn recv_is_writer(&self) -> bool {
+        self.class
+            .as_ref()
+            .is_some_and(|class| class.scope == CACHE_IR_WRITER)
     }
-}
 
-/// Where the item being translated sits. Flows down; immutable.
-struct Ctx {
-    unit: Unit,
+    /// Whether this is a stub generator, whose `AttachDecision` return is
+    /// protocol with the dispatcher rather than a value.
+    fn is_stub_generator(&self) -> bool {
+        let Some(class) = &self.class else {
+            return false;
+        };
+        let scope: Vec<&str> = class.scope.iter().map(String::as_str).collect();
+        matches!(scope.as_slice(), ["js", "jit", name] if STUB_GENERATORS.contains(name))
+    }
+
+    /// The item a field qualifies against, since Cachet won't resolve a bare
+    /// field name inside an `op`.
+    ///
+    /// `None` for anything translated as a top-level `fn` -- a free function, or
+    /// a writer wrapper, which reads no writer state -- and for a class we don't
+    /// recognize, so a field is refused rather than qualified against something
+    /// that doesn't hold it.
+    fn parent(&self) -> Option<CachetPath> {
+        let class = self.class.as_ref()?;
+        if class.scope == CACHE_IR_COMPILER {
+            // An instruction is an `op` in `ir CacheIR`, not in its own class.
+            return Some(CachetPath::from_ident("CacheIR"));
+        }
+        self.is_stub_generator()
+            .then(|| CachetPath::from_ident(Ident::from(class.name().to_owned())))
+    }
 }
 
 /// A C++ method to the Cachet function that models it.
@@ -363,6 +454,69 @@ fn translate_unary_oper(op: &str) -> Option<NegateKind> {
     })
 }
 
+/// `Int32OperandId(input.id())`: an operand id rebuilt from another one's slot
+/// number.
+///
+/// Not really a construction. Nothing is allocated and no CacheIR is emitted:
+/// the slot is the same slot, and only the static type it carries changes. The
+/// model spells that `OperandId::toInt32Id(input)`
+/// (notes/cacheir.cachet:102-138), which is why this is the one construction
+/// shape that translates.
+fn translate_retype(
+    ctx: &Ctx<'_>,
+    needed: &mut Vec<Needed>,
+    c: &CppConstruct,
+) -> Result<Expr, Unhandled> {
+    let unmodeled = || Unhandled::new(format!("construction of `{}`", c.ty.spelled));
+
+    let ty = translate_type(&c.ty).map_err(|_| unmodeled())?;
+    if !is_operand_id(&ty) {
+        return Err(unmodeled());
+    }
+
+    // The sole argument has to be another operand id's `id()`, since that is
+    // what makes this a retyping of an existing slot rather than a fresh value.
+    let [arg] = c.args.as_slice() else {
+        return Err(unmodeled());
+    };
+    let CppExpr::Call(call) = &arg.value else {
+        return Err(unmodeled());
+    };
+    let CppCallee::Method {
+        recv: Some(recv),
+        callee,
+    } = &call.callee
+    else {
+        return Err(unmodeled());
+    };
+    if callee.name != "id" || !call.args.is_empty() {
+        return Err(unmodeled());
+    }
+    let recv_ty = translate_type(named_type(recv)?)?;
+    if !is_operand_id(&recv_ty) {
+        return Err(unmodeled());
+    }
+
+    // `to*Id` is declared on `OperandId`, and every id type is one, so the
+    // receiver is passed as-is and Cachet upcasts it.
+    Ok(Expr::Invoke(Call {
+        target: Spanned::internal(
+            CachetPath::from_ident("OperandId").nest(Ident::from(format!("to{ty}"))),
+        ),
+        args: Spanned::internal(vec![Spanned::internal(Arg::Expr(translate_expr(
+            ctx, needed, recv,
+        )?))]),
+    }))
+}
+
+/// `trackAttached(..)` on a generator's implicit `this`.
+fn is_track_attached(call: &CppCall) -> bool {
+    matches!(
+        &call.callee,
+        CppCallee::Method { recv: None, callee } if callee.name == "trackAttached"
+    )
+}
+
 /// The declared type of whatever an expression names.
 ///
 /// Needed to key [`translate_method`]: only a name carries a type in the
@@ -377,8 +531,8 @@ fn named_type(expr: &CppSpanned<CppExpr>) -> Result<&CppType, Unhandled> {
 /// Errors from a sub-expression already point at the narrowest construct that
 /// failed, so a span is filled in only where none was set.
 fn translate_expr(
-    ctx: &Ctx,
-    needed: &mut Vec<FnRef>,
+    ctx: &Ctx<'_>,
+    needed: &mut Vec<Needed>,
     expr: &CppSpanned<CppExpr>,
 ) -> Result<Expr, Unhandled> {
     translate_expr_value(ctx, needed, expr).map_err(|e| match e.span {
@@ -388,8 +542,8 @@ fn translate_expr(
 }
 
 fn translate_expr_value(
-    ctx: &Ctx,
-    needed: &mut Vec<FnRef>,
+    ctx: &Ctx<'_>,
+    needed: &mut Vec<Needed>,
     expr: &CppSpanned<CppExpr>,
 ) -> Result<Expr, Unhandled> {
     match &expr.value {
@@ -400,14 +554,61 @@ fn translate_expr_value(
             // A field is a `var` on the enclosing item, and Cachet requires it
             // qualified: `field` alone doesn't resolve inside an `op`.
             RefKind::Field => {
-                let parent = ctx.unit.parent().ok_or_else(|| {
-                    Unhandled::new(format!("field `{}` outside an ir", r.name))
-                })?;
+                let parent = ctx
+                    .parent()
+                    .ok_or_else(|| Unhandled::new(format!("field `{}` outside an ir", r.name)))?;
                 Ok(Expr::Var(Spanned::internal(
                     parent.nest(Ident::from(r.name.clone())),
                 )))
             }
         },
+
+        // A writer call used as a value has to yield an operand id, and only
+        // the wrapper can: `emit` is a statement, so the op alone cannot stand
+        // in an expression.
+        CppExpr::Call(call) if writer_call(ctx, call).is_some() => {
+            let callee = writer_call(ctx, call).unwrap();
+            let method = callee.name.as_str();
+            let op = resolve_op(ctx.ops, method)?;
+
+            let target = if op.custom_writer {
+                // `custom_writer` means the public method is hand-written
+                // (CacheIRWriter.h), so it is translated like any other helper
+                // rather than derived from the yaml -- its arity and return type
+                // are its own, not the op's. Translating it as a free function is
+                // sound because it reads no writer state: only its parameters and
+                // the generated method behind it, which the yaml names `<Op>_`.
+                needed.push(Needed::Cpp(callee.clone()));
+                CachetPath::from_ident(Ident::from(method.to_owned()))
+            } else {
+                check_arity(op, method, call.args.len())?;
+                let Some(helper) = helper_sig(op)? else {
+                    return Err(Unhandled::new(format!(
+                        "`writer.{method}`: op `{}` has no result operand, so the \
+                         call yields nothing to use as a value",
+                        op.name
+                    )));
+                };
+                // The wrapper doesn't exist in C++ -- it stands in for the
+                // generated writer method -- so it is synthesized from the yaml.
+                needed.push(Needed::Wrapper(op.name.clone()));
+                CachetPath::from_ident(helper.ident)
+            };
+
+            let args = call
+                .args
+                .iter()
+                .map(|arg| {
+                    Ok(Spanned::internal(Arg::Expr(translate_expr(
+                        ctx, needed, arg,
+                    )?)))
+                })
+                .collect::<Result<Vec<_>, Unhandled>>()?;
+            Ok(Expr::Invoke(Call {
+                target: Spanned::internal(target),
+                args: Spanned::internal(args),
+            }))
+        }
 
         CppExpr::Call(call) => match &call.callee {
             CppCallee::Method {
@@ -440,7 +641,7 @@ fn translate_expr_value(
                 // recorded for the caller to translate, and the call is emitted
                 // against its own name.
                 let target = translate_free(&callee.name).unwrap_or_else(|| {
-                    needed.push(callee.clone());
+                    needed.push(Needed::Cpp(callee.clone()));
                     CachetPath::from_ident(Ident::from(callee.name.clone()))
                 });
                 let args = call
@@ -480,17 +681,33 @@ fn translate_expr_value(
             })))
         }
 
-        CppExpr::Construct(c) => Err(Unhandled::new(format!("construction of `{}`", c.ty.spelled))),
+        CppExpr::Construct(c) => translate_retype(ctx, needed, c),
         CppExpr::EnumConst(e) => Err(Unhandled::new(format!("enum constant `{}::{}`", e.ty, e.name))),
-        CppExpr::Lit(_) => Err(Unhandled::new(String::from("literal"))),
+        // An unsuffixed C++ integer literal is an `int`, so it is `Int32` unless
+        // the value doesn't fit. The subset keeps the value rather than the
+        // spelling, so a suffix in the source isn't recoverable here; a literal
+        // that reaches a parameter of some other width will fail to type check
+        // rather than be silently coerced.
+        CppExpr::Lit(CppLit::Int(n)) => Ok(Expr::Literal(match i32::try_from(*n) {
+            Ok(n) => Literal::Int32(n),
+            Err(_) => Literal::Int64(*n),
+        })),
+        CppExpr::Lit(CppLit::Double(d)) => Ok(Expr::Literal(Literal::Double(*d))),
+        // `true` and `false` are built-in variables, not literals
+        // (built_in.rs:206).
+        CppExpr::Lit(CppLit::Bool(b)) => Ok(Expr::Var(Spanned::internal(
+            CachetPath::from_ident(if *b { "true" } else { "false" }),
+        ))),
+        // Cachet's literals are numeric, and it models no string type.
+        CppExpr::Lit(CppLit::Str(s)) => Err(Unhandled::new(format!("string literal {s:?}"))),
         CppExpr::This => Err(Unhandled::new(String::from("`this`"))),
     }
 }
 
 /// One C++ statement can yield several, so this returns a list.
 fn translate_stmt(
-    ctx: &Ctx,
-    needed: &mut Vec<FnRef>,
+    ctx: &Ctx<'_>,
+    needed: &mut Vec<Needed>,
     stmt: &CppSpanned<CppStmt>,
 ) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
     translate_stmt_values(ctx, needed, stmt).map_err(|e| match e.span {
@@ -500,8 +717,8 @@ fn translate_stmt(
 }
 
 fn translate_stmt_values(
-    ctx: &Ctx,
-    needed: &mut Vec<FnRef>,
+    ctx: &Ctx<'_>,
+    needed: &mut Vec<Needed>,
     stmt: &CppSpanned<CppStmt>,
 ) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
     match &stmt.value {
@@ -510,13 +727,13 @@ fn translate_stmt_values(
             // with the dispatcher rather than a value: whether it attached is
             // the dispatcher's business, and `ReturnFromIC` comes from a
             // `writer.returnFromIC()` call, not from returning `Attach`.
-            let value = match ctx.unit {
-                Unit::StubGenerator { .. } => None,
-                _ => ret
-                    .value
+            let value = if ctx.is_stub_generator() {
+                None
+            } else {
+                ret.value
                     .as_ref()
                     .map(|v| translate_expr(ctx, needed, v))
-                    .transpose()?,
+                    .transpose()?
             };
             Ok(vec![Spanned::internal(Stmt::Ret(RetStmt {
                 value: Spanned::internal(value),
@@ -551,14 +768,27 @@ fn translate_stmt_values(
         }
         CppStmt::Assert(_) => Err(Unhandled::new(String::from("assertion"))),
         // `writer.compareDoubleResult(..)` records a CacheIR op, which Cachet
-        // spells `emit CacheIR::CompareDoubleResult(..)`. The op name is the
-        // method's, capitalized -- both come from the same entry in
-        // CacheIROps.yaml. Arguments carry over unchanged.
+        // spells `emit CacheIR::CompareDoubleResult(..)`. Arguments carry over
+        // unchanged.
         //
         // The op's *semantics* live in `CacheIRCompiler::emit<Op>`, which is a
         // separate unit to translate; the call is not chased into it.
-        CppStmt::Expr(CppExpr::Call(call)) if writer_call(call).is_some() => {
-            let name = writer_call(call).unwrap();
+        CppStmt::Expr(CppExpr::Call(call)) if writer_call(ctx, call).is_some() => {
+            let method = writer_call(ctx, call).unwrap().name.as_str();
+            let op = resolve_op(ctx.ops, method)?;
+            check_arity(op, method, call.args.len())?;
+
+            // An op that allocates a result is reachable only through its
+            // wrapper, and here the wrapper's value would be dropped -- which
+            // Cachet has no way to spell, since a statement must have type
+            // `Unit` (type_checker.rs:1218) and there is no name to bind to.
+            if let Some(helper) = helper_sig(op)? {
+                return Err(Unhandled::new(format!(
+                    "`writer.{method}` allocates a `{}` that C++ discards",
+                    helper.ret
+                )));
+            }
+
             let args = call
                 .args
                 .iter()
@@ -569,11 +799,18 @@ fn translate_stmt_values(
                 })
                 .collect::<Result<Vec<_>, Unhandled>>()?;
             Ok(vec![Spanned::internal(Stmt::Emit(Call {
-                target: Spanned::internal(
-                    CachetPath::from_ident("CacheIR").nest(Ident::from(op_ident(name))),
-                ),
+                target: Spanned::internal(op_path(op)),
                 args: Spanned::internal(args),
             }))])
+        }
+        // `trackAttached("Compare.Int32")` records which stub was attached, for
+        // the IC spewer: it sets `stubName_` and, under `JS_CACHEIR_SPEW`, logs
+        // the operands (CacheIR.cpp:15353). No CacheIR is emitted and the stub
+        // is unaffected, so it is dropped rather than translated.
+        CppStmt::Expr(CppExpr::Call(call))
+            if ctx.is_stub_generator() && is_track_attached(call) =>
+        {
+            Ok(Vec::new())
         }
         CppStmt::Expr(_) => Err(Unhandled::new(String::from("expression statement"))),
     }
@@ -627,8 +864,8 @@ fn unhandled_comment(e: &Unhandled, stmt: &CppSpan) -> Comment {
 /// A statement that can't be translated becomes a comment rather than failing
 /// the whole body.
 fn translate_block(
-    ctx: &Ctx,
-    needed: &mut Vec<FnRef>,
+    ctx: &Ctx<'_>,
+    needed: &mut Vec<Needed>,
     body: &CppCompoundStmt,
 ) -> Result<Block, Unhandled> {
     let mut stmts = Vec::new();
@@ -665,13 +902,19 @@ fn translate_block(
 /// Translated rather than modelled: it has no entry in [`translate_method`], so
 /// the translation descends into its definition. A helper that *does* have an
 /// entry bottoms out there instead, and never needs translating.
-pub fn translate_fn_def(fn_def: &FnDef) -> Result<(CallableItem, Vec<FnRef>), Unhandled> {
+pub fn translate_fn_def(
+    ops: &Ops,
+    class: Option<ClassRef>,
+    fn_def: &FnDef,
+) -> Result<(CallableItem, Vec<Needed>), Unhandled> {
+    // A helper is top-level, so it has no parent to qualify names against.
+    // `needed` is created here and returned: its scope is this one definition.
+    let ctx = Ctx { class, ops };
+
     // Taking a writer is what makes a function emit, so dropping the parameter
-    // is what the `emits` clause replaces.
-    let emits = fn_def
-        .params
-        .iter()
-        .any(|param| is_writer(&param.ty))
+    // is what the `emits` clause replaces. A `CacheIRWriter` method takes no
+    // such parameter -- it is the writer -- and emits all the same.
+    let emits = (ctx.recv_is_writer() || fn_def.params.iter().any(|param| is_writer(&param.ty)))
         .then(|| Spanned::internal(CachetPath::from_ident("CacheIR")));
 
     let params = fn_def
@@ -694,20 +937,12 @@ pub fn translate_fn_def(fn_def: &FnDef) -> Result<(CallableItem, Vec<FnRef>), Un
     let ret =
         translate_type(&fn_def.ret).map_err(|e| Unhandled::new(format!("return type: {}", e.what)))?;
 
-    // A helper is top-level, so it has no parent to qualify names against.
-    // `needed` is created here and returned: its scope is this one definition.
     let mut needed = Vec::new();
-    let body = translate_block(
-        &Ctx {
-            unit: Unit::Helper,
-        },
-        &mut needed,
-        &fn_def.body,
-    )?;
+    let body = translate_block(&ctx, &mut needed, &fn_def.body)?;
 
     let item = CallableItem {
         // Kept verbatim, as field and local names are.
-        ident: Spanned::internal(Ident::from(fn_def.name.clone())),
+        ident: Spanned::internal(Ident::from(fn_def.name.name.clone())),
         attrs: Vec::new(),
         is_unsafe: false,
         params,
@@ -730,15 +965,15 @@ fn op_ident(method: &str) -> String {
 
 /// `op TryAttachNumber() { <preamble> <body> }`, with the helpers it needs.
 fn create_generator_op(
-    ctx: &Ctx,
-    gen_def: &GenDef,
-) -> Result<(CallableItem, Vec<FnRef>), Unhandled> {
-    let preamble = translate_preamble(&gen_def.params)?;
+    ctx: &Ctx<'_>,
+    gen_def: &MethodDef,
+) -> Result<(CallableItem, Vec<Needed>), Unhandled> {
+    let preamble = translate_preamble(&gen_def.def.params)?;
     let mut needed = Vec::new();
-    let body = translate_block(ctx, &mut needed, &gen_def.body)?;
+    let body = translate_block(ctx, &mut needed, &gen_def.def.body)?;
 
     let item = CallableItem {
-        ident: Spanned::internal(Ident::from(op_ident(&gen_def.method))),
+        ident: Spanned::internal(Ident::from(op_ident(&gen_def.def.name.name))),
         attrs: Vec::new(),
         is_unsafe: false,
         // No parameters: the operands arrive through the preamble's
@@ -760,20 +995,31 @@ fn create_generator_op(
 /// `CompareIRGenerator::tryAttachNumber` becomes
 /// `ir CompareIRGenerator emits CacheIR { .. }`: the generator class names the
 /// `ir`, and every stub generator emits CacheIR.
-pub fn translate_gen_def(gen_def: &GenDef) -> Result<(IrItem, Vec<FnRef>), Unhandled> {
+pub fn translate_gen_def(
+    ops: &Ops,
+    gen_def: &MethodDef,
+) -> Result<(IrItem, Vec<Needed>), Unhandled> {
     // `writer` is how the C++ emits, not state the generator holds: each
     // `writer.foo(..)` becomes an `emit`, so the field itself has no
     // counterpart in the `ir` and is dropped before translating the rest.
-    let fields: Vec<Ref> = get_gen_def_fields(&gen_def)
+    let fields: Vec<Ref> = get_method_def_fields(gen_def)
         .into_iter()
         .filter(|field| field.ty.scope != CACHE_IR_WRITER)
         .collect();
     let var_items = create_field_var_items(&fields)?;
     let ctx = Ctx {
-        unit: Unit::StubGenerator {
-            ir: Ident::from(gen_def.class.clone()),
-        },
+        class: Some(gen_def.class.clone()),
+        ops,
     };
+
+    // The `ir` is named after the class, so it has to be a class we know is a
+    // stub generator rather than any method's owner.
+    if !ctx.is_stub_generator() {
+        return Err(Unhandled::new(format!(
+            "`{}`: not a known stub generator class",
+            gen_def.class
+        )));
+    }
     let (op, needed) = create_generator_op(&ctx, gen_def)?;
     let generator_op = Item::Op(op);
 
@@ -788,7 +1034,7 @@ pub fn translate_gen_def(gen_def: &GenDef) -> Result<(IrItem, Vec<FnRef>), Unhan
         IrItem {
             // Spans are `internal` throughout: these nodes are synthesized, so
             // there is no Cachet source location to point at.
-            ident: Spanned::internal(Ident::from(gen_def.class.clone())),
+            ident: Spanned::internal(Ident::from(gen_def.class.name().to_owned())),
             emits: Some(Spanned::internal(CachetPath::from_ident("CacheIR"))),
             items,
         },
@@ -801,6 +1047,8 @@ pub fn translate_gen_def(gen_def: &GenDef) -> Result<(IrItem, Vec<FnRef>), Unhan
 pub enum Error {
     Extract(SubsetError),
     Unhandled(Unhandled),
+    /// `CacheIROps.yaml` could not be read.
+    Ops(String),
 }
 
 impl fmt::Display for Error {
@@ -808,6 +1056,7 @@ impl fmt::Display for Error {
         match self {
             Error::Extract(e) => write!(f, "{e}"),
             Error::Unhandled(e) => write!(f, "{e}"),
+            Error::Ops(e) => write!(f, "{e}"),
         }
     }
 }
@@ -839,7 +1088,7 @@ fn cpp_signature(fn_def: &FnDef) -> String {
     format!(
         "{} {}({})",
         fn_def.ret.spelled,
-        fn_def.name,
+        fn_def.name.name,
         params.join(", ")
     )
 }
@@ -849,17 +1098,79 @@ fn cpp_signature(fn_def: &FnDef) -> String {
 /// Helpers come first, then the `ir`. Translation drives the descent: a helper
 /// is only translated because emitted code calls it, so a statement that fell
 /// back to a comment pulls nothing in.
+pub fn load_ops() -> Result<Ops, Error> {
+    let path = Ops::default_path().ok_or_else(|| {
+        Error::Ops(String::from(
+            "no CacheIROps.yaml: this binary was built with PHOENIX_SKIP_SETUP",
+        ))
+    })?;
+    Ops::load(path).map_err(|e| Error::Ops(e.to_string()))
+}
+
+/// A callee's definition, as the top-level `fn` the translator will make of it.
+///
+/// A method is accepted only where its class makes it a helper. A
+/// `CacheIRWriter` wrapper qualifies: it reads no writer state, only its
+/// parameters and the op behind it, so nothing is lost by dropping the receiver.
+/// A method on any other class carries state or ambient entities that a
+/// top-level `fn` cannot, and needs a unit of its own.
+fn extract_helper<'tu>(entity: &Entity<'tu>) -> Result<(Option<ClassRef>, FnDef<'tu>), Error> {
+    match entity.get_kind() {
+        EntityKind::Method => {
+            let method = get_method_def(entity)?;
+            // The class comes along, because what it makes ambient is exactly
+            // what a bare `FnDef` would have lost: inside a wrapper, `this` is
+            // the writer, so `guardToInt32_(input)` is a writer call.
+            if method.class.scope != CACHE_IR_WRITER {
+                return Err(Unhandled::new(format!(
+                    "`{}::{}`: a method on a class other than CacheIRWriter",
+                    method.class, method.def.name.name
+                ))
+                .into());
+            }
+            Ok((Some(method.class), method.def))
+        }
+        _ => Ok((None, get_fn_def(entity)?)),
+    }
+}
+
 pub fn translate_generator(generator: &Entity<'_>) -> Result<Mod, Error> {
-    let gen_def = get_gen_def(generator)?;
-    let (ir, needed) = translate_gen_def(&gen_def)?;
+    let ops = load_ops()?;
+    let gen_def = get_method_def(generator)?;
+    let (ir, needed) = translate_gen_def(&ops, &gen_def)?;
 
     // Each definition brings its own callees, so deeper helpers stay resolvable.
-    let mut callees = gen_def.callees;
-    let mut queue: VecDeque<FnRef> = needed.into();
-    let mut seen: HashSet<FnId> = HashSet::new();
+    let mut callees = gen_def.def.callees;
+    let mut queue: VecDeque<Needed> = needed.into();
+    // Seeded with the generator itself, so a helper that calls back into it is
+    // not translated a second time.
+    let mut seen: HashSet<FnId> = HashSet::from([gen_def.def.name.id]);
+    // Wrappers are identified by op name rather than by a C++ symbol, since
+    // there is no C++ definition behind them.
+    let mut wrapped: HashSet<String> = HashSet::new();
     let mut helpers = Vec::new();
 
-    while let Some(fn_ref) = queue.pop_front() {
+    while let Some(next) = queue.pop_front() {
+        let fn_ref = match next {
+            Needed::Cpp(fn_ref) => fn_ref,
+            Needed::Wrapper(op_name) => {
+                if !wrapped.insert(op_name.clone()) {
+                    continue;
+                }
+                // The op is in the table -- resolving the call is what put this
+                // on the queue -- so only synthesis can fail from here.
+                let op = ops.get(&op_name).expect("op resolved earlier");
+                match create_op_wrapper(op) {
+                    Ok(item) => helpers.push(Spanned::internal(Item::Fn(item))),
+                    Err(e) => helpers.push(note(format!(
+                        "cannot synthesize a wrapper for `{}`: {e}",
+                        writer_method(op)
+                    ))),
+                }
+                continue;
+            }
+        };
+
         // Insert before translating, so a cycle terminates instead of looping.
         if !seen.insert(fn_ref.id.clone()) {
             continue;
@@ -875,14 +1186,14 @@ pub fn translate_generator(generator: &Entity<'_>) -> Result<Mod, Error> {
             )));
             continue;
         };
-        let fn_def = match get_fn_def(&entity) {
-            Ok(fn_def) => fn_def,
+        let (class, fn_def) = match extract_helper(&entity) {
+            Ok(extracted) => extracted,
             Err(e) => {
                 helpers.push(note(format!("cannot extract `{}`: {e}", fn_ref.name)));
                 continue;
             }
         };
-        match translate_fn_def(&fn_def) {
+        match translate_fn_def(&ops, class, &fn_def) {
             Ok((item, more)) => {
                 helpers.push(Spanned::internal(Item::Fn(item)));
                 callees.extend(fn_def.callees);

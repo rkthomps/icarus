@@ -9,4 +9,6 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 cachet-lang = { path = "../cachet-lang" }
 serde_json = "1"
+serde_yaml = "0.9"
+indexmap = { version = "2", features = ["serde"] }
 shlex = "1"

@@ -948,6 +948,26 @@ fn extract_expr_value(e: Entity) -> Result<Expr> {
         // one.
         EntityKind::CallExpr if is_construction(e) => Ok(Expr::Construct(extract_construct(e)?)),
         EntityKind::CallExpr => Ok(Expr::Call(extract_call(e)?)),
+        // `T(x)` where `T` is a class, as in `Int32OperandId(input.id())`: the
+        // cast wraps the construction it names, both covering the same text, so
+        // it carries nothing the construction doesn't and is transparent.
+        //
+        // Only for a construction, though. A functional cast to a non-class type
+        // -- `uint16_t(x)` -- is a value conversion, and dropping it would lose a
+        // narrowing, so that stays unsupported.
+        EntityKind::FunctionalCastExpr => {
+            let constructed = e
+                .get_children()
+                .into_iter()
+                .find(|c| !is_type_ref(*c))
+                .map(strip)
+                .filter(|c| is_construction(*c))
+                .ok_or(Unsupported::Expr {
+                    kind: e.get_kind(),
+                    loc: loc(e),
+                })?;
+            Ok(Expr::Construct(extract_construct(constructed)?))
+        }
         EntityKind::ThisExpr => Ok(Expr::This),
         EntityKind::DeclRefExpr | EntityKind::MemberRefExpr => extract_ref(e),
         EntityKind::UnaryOperator => {
@@ -1235,79 +1255,86 @@ fn extract_body(def: Entity, unit: &str) -> std::result::Result<CompoundStmt, Er
     })
 }
 
-/// A stub generator: a method definition on a `*IRGenerator` class.
-#[derive(Clone, Debug)]
-pub struct GenDef<'tu> {
-    pub class: String,
-    pub method: String,
-    pub params: Vec<Param>,
-    pub body: CompoundStmt,
-    pub callees: Callees<'tu>,
+/// The class a method is defined on.
+///
+/// Qualified rather than a bare name because the class is what decides how a
+/// method is translated: a `CacheIRWriter` method is a wrapper over an op, a
+/// `*IRGenerator` method is a stub generator, a `CacheIRCompiler` method is an
+/// instruction. That policy lives in the translator, which needs to be able to
+/// tell them apart exactly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassRef {
+    /// Outermost first, ending with the class: `["js", "jit", "CacheIRWriter"]`.
+    pub scope: Vec<String>,
 }
 
-/// Finds a generator's shape and extracts its body into the modeled subset.
+impl ClassRef {
+    pub fn name(&self) -> &str {
+        self.scope.last().map(String::as_str).unwrap_or_default()
+    }
+}
+
+impl fmt::Display for ClassRef {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.scope.join("::"))
+    }
+}
+
+/// A method definition: a function definition plus the class it is on.
+///
+/// A stub generator is one of these, and so is a `CacheIRWriter` wrapper. What
+/// distinguishes them is [`ClassRef`], not their shape, so they extract the
+/// same way and the translator decides what each becomes.
+#[derive(Clone, Debug)]
+pub struct MethodDef<'tu> {
+    pub class: ClassRef,
+    pub def: FnDef<'tu>,
+}
+
+/// Finds a method's shape and extracts its body into the modeled subset.
 /// Everything downstream works on the result, never on clang entities.
-pub fn get_gen_def<'tu>(generator: &Entity<'tu>) -> std::result::Result<GenDef<'tu>, Error> {
-    let generator = *generator;
+pub fn get_method_def<'tu>(method: &Entity<'tu>) -> std::result::Result<MethodDef<'tu>, Error> {
+    let method = *method;
 
-    if generator.get_kind() != EntityKind::Method {
+    if method.get_kind() != EntityKind::Method {
         return Err(Error::Signature {
-            what: format!("expected a method, found {:?}", generator.get_kind()),
-            loc: loc(generator),
-        });
-    }
-    // A declaration has no body to translate; we need the out-of-line
-    // definition in CacheIR.cpp, not the one in CacheIRGenerator.h.
-    if !generator.is_definition() {
-        return Err(Error::Signature {
-            what: String::from("expected a method definition, found a declaration"),
-            loc: loc(generator),
+            what: format!("expected a method, found {:?}", method.get_kind()),
+            loc: loc(method),
         });
     }
 
-    // Semantic, not lexical: the body lives in CacheIR.cpp while the class is
-    // declared in CacheIRGenerator.h, so the lexical parent is the namespace.
-    let class = generator
+    // Semantic, not lexical: a generator's body lives in CacheIR.cpp while its
+    // class is declared in CacheIRGenerator.h, so the lexical parent is the
+    // namespace.
+    let class = method
         .get_semantic_parent()
         .filter(|p| matches!(p.get_kind(), EntityKind::ClassDecl | EntityKind::StructDecl))
-        .and_then(|p| p.get_name())
         .ok_or_else(|| Error::Signature {
             what: String::from("method has no owning class"),
-            loc: loc(generator),
+            loc: loc(method),
         })?;
+    let class = ClassRef {
+        scope: scope_path(class),
+    };
 
-    let method = generator.get_name().ok_or_else(|| Error::Signature {
-        what: String::from("method has no name"),
-        loc: loc(generator),
-    })?;
-
-    let unit = format!("{class}::{method}");
-    let params = extract_params(generator, &unit)?;
-    let body = extract_body(generator, &unit)?;
-
-    Ok(GenDef {
-        class,
-        method,
-        params,
-        body,
-        callees: collect_callees(generator),
-    })
+    let def = get_callable_def(method, &class.to_string())?;
+    Ok(MethodDef { class, def })
 }
 
 /// A free function defined in the CacheIR sources, e.g.
 /// `CanConvertToDoubleForToNumber` or `EmitGuardToDoubleForToNumber`.
 #[derive(Clone, Debug)]
 pub struct FnDef<'tu> {
-    pub name: String,
+    /// Its name and its own identity, so a definition can be matched against
+    /// the call that reached it.
+    pub name: FnRef,
     pub params: Vec<Param>,
     pub ret: Type,
     pub body: CompoundStmt,
     pub callees: Callees<'tu>,
 }
 
-/// Extracts a free function's definition into the modeled subset. Unlike a
-/// generator it has no owning class, and its return type is explicit rather
-/// than always `AttachDecision`.
+/// Extracts a free function's definition into the modeled subset.
 pub fn get_fn_def<'tu>(function: &Entity<'tu>) -> std::result::Result<FnDef<'tu>, Error> {
     let function = *function;
 
@@ -1317,36 +1344,57 @@ pub fn get_fn_def<'tu>(function: &Entity<'tu>) -> std::result::Result<FnDef<'tu>
             loc: loc(function),
         });
     }
-    if !function.is_definition() {
+    get_callable_def(function, "function")
+}
+
+/// The part that is the same for a free function and a method: the name and
+/// identity, the signature, the body, and what it calls.
+///
+/// `what` names the kind of callable, for error messages raised before the
+/// name is known.
+fn get_callable_def<'tu>(
+    callable: Entity<'tu>,
+    what: &str,
+) -> std::result::Result<FnDef<'tu>, Error> {
+    // A declaration has no body to translate; we need the out-of-line
+    // definition, not the one in the header.
+    if !callable.is_definition() {
         return Err(Error::Signature {
-            what: String::from("expected a function definition, found a declaration"),
-            loc: loc(function),
+            what: format!("expected a {what} definition, found a declaration"),
+            loc: loc(callable),
         });
     }
 
-    let name = function.get_name().ok_or_else(|| Error::Signature {
-        what: String::from("function has no name"),
-        loc: loc(function),
+    let name = callable.get_name().ok_or_else(|| Error::Signature {
+        what: format!("{what} has no name"),
+        loc: loc(callable),
     })?;
 
-    let ret = function.get_result_type().ok_or_else(|| Error::Signature {
+    // Its own identity, so a worklist can recognize the definition it asked for
+    // and a callable that reaches itself can be caught.
+    let id = fn_id(callable).ok_or_else(|| Error::Signature {
+        what: format!("{name} has no USR"),
+        loc: loc(callable),
+    })?;
+
+    let ret = callable.get_result_type().ok_or_else(|| Error::Signature {
         what: format!("{name} has no return type"),
-        loc: loc(function),
+        loc: loc(callable),
     })?;
-    let ret = type_of(ret, function).map_err(|e| Error::Signature {
+    let ret = type_of(ret, callable).map_err(|e| Error::Signature {
         what: format!("return type: {e}"),
-        loc: loc(function),
+        loc: loc(callable),
     })?;
 
-    let params = extract_params(function, &name)?;
-    let body = extract_body(function, &name)?;
+    let params = extract_params(callable, &name)?;
+    let body = extract_body(callable, &name)?;
 
     Ok(FnDef {
-        name,
+        name: FnRef { name, id },
         params,
         ret,
         body,
-        callees: collect_callees(function),
+        callees: collect_callees(callable),
     })
 }
 
@@ -1360,19 +1408,23 @@ fn indent(f: &mut fmt::Formatter, depth: usize) -> fmt::Result {
     write!(f, "{:indent$}", "", indent = depth * 2)
 }
 
-impl fmt::Display for GenDef<'_> {
+impl fmt::Display for MethodDef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "Method `{}` [{}]", self.method, self.class)?;
-        for p in &self.params {
+        writeln!(
+            f,
+            "Method `{}` [{}] -> {}",
+            self.def.name.name, self.class, self.def.ret.spelled
+        )?;
+        for p in &self.def.params {
             writeln!(f, "  ParmDecl `{}` : {}", p.name, p.ty.spelled)?;
         }
-        fmt_block(f, &self.body, 1)
+        fmt_block(f, &self.def.body, 1)
     }
 }
 
 impl fmt::Display for FnDef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "Function `{}` -> {}", self.name, self.ret.spelled)?;
+        writeln!(f, "Function `{}` -> {}", self.name.name, self.ret.spelled)?;
         for p in &self.params {
             writeln!(f, "  ParmDecl `{}` : {}", p.name, p.ty.spelled)?;
         }

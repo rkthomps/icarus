@@ -95,14 +95,20 @@ pub fn qualified_name(e: Entity) -> String {
     }
 }
 
-/// Walk top-level declarations (including those nested in namespaces) looking
-/// for the method *definition* whose qualified name matches.
+/// Walk top-level declarations (including those nested in namespaces and
+/// classes) looking for the method *definition* whose qualified name matches.
+///
+/// Classes are descended into because a method can be defined inside its class
+/// rather than out of line: every `CacheIRWriter` method is, so without this the
+/// whole header is invisible.
 pub fn find_definition<'tu>(root: Entity<'tu>, qualified: &str) -> Option<Entity<'tu>> {
     let mut found = None;
     root.visit_children(|e, _| {
         use clang::EntityVisitResult::*;
         match e.get_kind() {
-            EntityKind::Namespace => return Recurse,
+            EntityKind::Namespace | EntityKind::ClassDecl | EntityKind::StructDecl => {
+                return Recurse;
+            }
             EntityKind::Method | EntityKind::FunctionDecl if e.is_definition() => {
                 if qualified_name(e) == qualified {
                     found = Some(e);

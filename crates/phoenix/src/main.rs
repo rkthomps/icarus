@@ -5,7 +5,7 @@
 //!           [--calls] [--depth N] [--subset]
 //!
 //! `--subset` dumps the generator lowered into the modeled C++ subset
-//! (`cpp_subset::GenDef`) instead of the raw clang AST.
+//! (`cpp_subset::MethodDef`) instead of the raw clang AST.
 //!
 //! `--db` defaults to the compile database that build.rs generated, and
 //! `--source` to js/src/jit/CacheIR.cpp.
@@ -304,10 +304,14 @@ fn main() {
             // A method is a stub generator, which becomes an `ir`; a free
             // function is a helper, which becomes a `fn`.
             let extracted = if def.get_kind() == EntityKind::FunctionDecl {
-                phoenix::cpp_subset::get_fn_def(&def)
+                phoenix::cpp_to_cachet::load_ops()
                     .map_err(|e| e.to_string())
-                    .and_then(|f| {
-                        phoenix::cpp_to_cachet::translate_fn_def(&f).map_err(|e| e.to_string())
+                    .and_then(|ops| {
+                        let f =
+                            phoenix::cpp_subset::get_fn_def(&def).map_err(|e| e.to_string())?;
+                        // A free function: no class, so nothing is ambient.
+                        phoenix::cpp_to_cachet::translate_fn_def(&ops, None, &f)
+                            .map_err(|e| e.to_string())
                     })
                     // TODO: `needed` names the helpers this one calls; the
                     // worklist that translates them isn't wired up yet.
@@ -335,7 +339,7 @@ fn main() {
             let extracted = if def.get_kind() == EntityKind::FunctionDecl {
                 phoenix::cpp_subset::get_fn_def(&def).map(|f| f.to_string())
             } else {
-                phoenix::cpp_subset::get_gen_def(&def).map(|g| g.to_string())
+                phoenix::cpp_subset::get_method_def(&def).map(|m| m.to_string())
             };
             match extracted {
                 Ok(text) => print!("{text}"),
