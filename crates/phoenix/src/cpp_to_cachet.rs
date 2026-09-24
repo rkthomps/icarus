@@ -1,13 +1,15 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
+use std::path::Path;
 
 use cachet_lang::ast::{
     BinOper, CompareBinOper, Ident, LogicalBinOper, Path as CachetPath, Spanned,
 };
-use cachet_lang::ast::{NegateKind, VarParamKind};
+use cachet_lang::ast::{CheckKind, NegateKind, VarParamKind};
 use cachet_lang::parser::{
-    Arg, BinOperExpr, Block, Call, CallableItem, Comment, ElseClause, Expr, GlobalVarItem,
-    IfStmt as CachetIfStmt, IrItem, Item, LetStmt, Literal, LocalVar, Mod, NegateExpr,
+    Arg, BinOperExpr, Block, Call, CallableItem, CheckStmt, Comment, ElseClause, Expr,
+    GlobalVarItem,
+    IfStmt as CachetIfStmt, ImportItem, IrItem, Item, LetStmt, Literal, LocalVar, Mod, NegateExpr,
     Param as CachetParam, RetStmt, Stmt, VarParam,
 };
 use clang::{Entity, EntityKind};
@@ -24,6 +26,38 @@ use crate::cpp_subset::{
 };
 use crate::cpp_subset::{ClassRef, MethodDef, Ref, Visit, get_method_def};
 
+/// Whether leaving a construct out still leaves a model of the C++.
+///
+/// The question a generated module has to answer is not "was anything left out"
+/// but "does what came out mean what the C++ means". Omitting an assertion
+/// weakens the proof; omitting a statement changes the behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Fidelity {
+    /// Left out on purpose, and sound to leave out: the model says less than the
+    /// C++ but nothing it says disagrees.
+    Elided,
+    /// Not translatable. Whatever came out is not what the C++ does, so
+    /// verifying it would verify the wrong program.
+    Failed,
+}
+
+/// A place where the output falls short of the C++.
+#[derive(Clone, Debug)]
+pub struct Gap {
+    pub fidelity: Fidelity,
+    pub what: String,
+    pub span: CppSpan,
+}
+
+impl fmt::Display for Gap {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match &self.span {
+            CppSpan::Unknown => write!(f, "{}", self.what),
+            span => write!(f, "{span}: {}", self.what),
+        }
+    }
+}
+
 /// A C++ construct with no Cachet counterpart yet.
 ///
 /// Translation refuses rather than guesses: a type mapped wrongly would verify
@@ -34,13 +68,36 @@ pub struct Unhandled {
     /// `Unknown` where the construct has no span to point at -- types and
     /// parameters aren't spanned, only statements and expressions.
     pub span: CppSpan,
+    pub fidelity: Fidelity,
 }
 
 impl Unhandled {
+    /// `Failed` is the default, so a construct nobody has considered lands in
+    /// the safe category: it takes an explicit [`Unhandled::elided`] to claim
+    /// that dropping something is harmless.
     pub fn new(what: impl Into<String>) -> Self {
         Unhandled {
             what: what.into(),
             span: CppSpan::Unknown,
+            fidelity: Fidelity::Failed,
+        }
+    }
+
+    /// For a construct the model deliberately does without.
+    pub fn elided(what: impl Into<String>) -> Self {
+        Unhandled {
+            fidelity: Fidelity::Elided,
+            ..Unhandled::new(what)
+        }
+    }
+
+    fn into_gap(self, span: &CppSpan) -> Gap {
+        Gap {
+            fidelity: self.fidelity,
+            what: self.what,
+            // The statement's span, which covers the whole construct, rather
+            // than the inner one the error points at.
+            span: span.clone(),
         }
     }
 
@@ -135,6 +192,16 @@ fn translate_type(ty: &CppType) -> Result<CachetPath, Unhandled> {
     }
 }
 
+/// What translating one definition accumulates: the names it referred to that
+/// still have to be defined, and the places it fell short of the C++.
+///
+/// State, not context: it flows back up, where [`Ctx`] flows down.
+#[derive(Default)]
+pub struct State {
+    pub needed: Vec<Needed>,
+    pub gaps: Vec<Gap>,
+}
+
 /// Something a translated body referred to that still has to be defined.
 ///
 /// Two ways to get one: translate the C++ definition, or synthesize it from a
@@ -225,26 +292,51 @@ fn invoke(target: CachetPath) -> Expr {
     })
 }
 
-/// The statements every stub generator opens with:
+/// The statements a `CompareIRGenerator` stub generator opens with:
 ///
 /// ```text
 /// initRegState();
 /// let lhsId = CacheIR::defineInputValueId();
 /// let rhsId = CacheIR::defineInputValueId();
 /// initValueOutput();
+/// assume JSOp::isEqualityOp(CompareIRGenerator::op_)
+///     || JSOp::isRelationalOp(CompareIRGenerator::op_);
 /// ```
 ///
-/// None of this comes from the generator's body. It is the calling convention
-/// the C++ inherits from `tryAttachStub`, which sets up register state and
-/// declares the input operands before dispatching to a generator. Since each
-/// generator is translated in isolation, the preamble is synthesized here.
+/// None of this comes from the generator's body. It is the contract of
+/// `CompareIRGenerator::tryAttachStub` (CacheIR.cpp:15291), which every
+/// `tryAttach*` inherits from its caller:
 ///
-/// The `let`s stand in for the method's parameters -- one each, named as C++
-/// names them -- so the body can refer to a parameter as an ordinary local.
-fn translate_preamble(params: &[Param]) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
-    // Only the two-value-operand shape is understood so far. Another operand
-    // kind would need its own `defineInput*`, and a non-value output would need
-    // something other than `initValueOutput`.
+/// ```cpp
+/// MOZ_ASSERT(cacheKind_ == CacheKind::Compare);
+/// MOZ_ASSERT(IsEqualityOp(op_) || IsRelationalOp(op_));
+/// ...
+/// ValOperandId lhsId(writer.setInputOperandId(lhsIndex));
+/// ValOperandId rhsId(writer.setInputOperandId(rhsIndex));
+/// ```
+///
+/// The two `setInputOperandId` calls are the two `defineInputValueId` `let`s,
+/// which also stand in for the method's parameters -- one each, named as C++
+/// names them -- so the body can refer to a parameter as an ordinary local. The
+/// `MOZ_ASSERT` on `op_` is the `assume`: unlike an assertion inside a generator,
+/// this one states what the caller guarantees, and without it `op_` is an
+/// arbitrary `JSOp` and `Condition::fromJSOp` has no case for it.
+///
+/// Every dispatcher has its own contract, so this is specific to
+/// `CompareIRGenerator`; another generator's preamble has to be read off its own
+/// `tryAttachStub` rather than assumed to match.
+fn translate_preamble(
+    class: &ClassRef,
+    params: &[Param],
+) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
+    if class.name() != "CompareIRGenerator" {
+        return Err(Unhandled::new(format!(
+            "`{class}`: no preamble modeled -- it has to come from that class's \
+             own `tryAttachStub`"
+        )));
+    }
+
+    // `tryAttachStub` declares exactly these two operands, both values.
     if let Some(other) = params.iter().find(|p| p.ty.scope != VAL_OPERAND_ID) {
         return Err(Unhandled::new(format!(
             "parameter `{}`: expected a ValOperandId, found `{}`",
@@ -279,6 +371,28 @@ fn translate_preamble(params: &[Param]) -> Result<Vec<Spanned<Stmt>>, Unhandled>
     stmts.push(Spanned::internal(Stmt::Expr(invoke(
         CachetPath::from_ident("initValueOutput"),
     ))));
+
+    // `MOZ_ASSERT(IsEqualityOp(op_) || IsRelationalOp(op_))`. The field is
+    // qualified, as a field reached from inside an `op` has to be.
+    let op_field = Expr::Var(Spanned::internal(
+        CachetPath::from_ident(Ident::from(class.name().to_owned())).nest(Ident::from("op_")),
+    ));
+    let is_op = |predicate: &str| {
+        Expr::Invoke(Call {
+            target: Spanned::internal(
+                CachetPath::from_ident("JSOp").nest(Ident::from(predicate.to_owned())),
+            ),
+            args: Spanned::internal(vec![Spanned::internal(Arg::Expr(op_field.clone()))]),
+        })
+    };
+    stmts.push(Spanned::internal(Stmt::Check(CheckStmt {
+        kind: CheckKind::Assume,
+        cond: Spanned::internal(Expr::BinOper(Box::new(BinOperExpr {
+            oper: Spanned::internal(BinOper::Logical(LogicalBinOper::Or)),
+            lhs: Spanned::internal(is_op("isEqualityOp")),
+            rhs: Spanned::internal(is_op("isRelationalOp")),
+        }))),
+    })));
 
     Ok(stmts)
 }
@@ -464,7 +578,7 @@ fn translate_unary_oper(op: &str) -> Option<NegateKind> {
 /// shape that translates.
 fn translate_retype(
     ctx: &Ctx<'_>,
-    needed: &mut Vec<Needed>,
+    state: &mut State,
     c: &CppConstruct,
 ) -> Result<Expr, Unhandled> {
     let unmodeled = || Unhandled::new(format!("construction of `{}`", c.ty.spelled));
@@ -504,7 +618,7 @@ fn translate_retype(
             CachetPath::from_ident("OperandId").nest(Ident::from(format!("to{ty}"))),
         ),
         args: Spanned::internal(vec![Spanned::internal(Arg::Expr(translate_expr(
-            ctx, needed, recv,
+            ctx, state, recv,
         )?))]),
     }))
 }
@@ -532,10 +646,10 @@ fn named_type(expr: &CppSpanned<CppExpr>) -> Result<&CppType, Unhandled> {
 /// failed, so a span is filled in only where none was set.
 fn translate_expr(
     ctx: &Ctx<'_>,
-    needed: &mut Vec<Needed>,
+    state: &mut State,
     expr: &CppSpanned<CppExpr>,
 ) -> Result<Expr, Unhandled> {
-    translate_expr_value(ctx, needed, expr).map_err(|e| match e.span {
+    translate_expr_value(ctx, state, expr).map_err(|e| match e.span {
         CppSpan::Unknown => e.at(&expr.span),
         _ => e,
     })
@@ -543,7 +657,7 @@ fn translate_expr(
 
 fn translate_expr_value(
     ctx: &Ctx<'_>,
-    needed: &mut Vec<Needed>,
+    state: &mut State,
     expr: &CppSpanned<CppExpr>,
 ) -> Result<Expr, Unhandled> {
     match &expr.value {
@@ -578,7 +692,7 @@ fn translate_expr_value(
                 // are its own, not the op's. Translating it as a free function is
                 // sound because it reads no writer state: only its parameters and
                 // the generated method behind it, which the yaml names `<Op>_`.
-                needed.push(Needed::Cpp(callee.clone()));
+                state.needed.push(Needed::Cpp(callee.clone()));
                 CachetPath::from_ident(Ident::from(method.to_owned()))
             } else {
                 check_arity(op, method, call.args.len())?;
@@ -591,7 +705,7 @@ fn translate_expr_value(
                 };
                 // The wrapper doesn't exist in C++ -- it stands in for the
                 // generated writer method -- so it is synthesized from the yaml.
-                needed.push(Needed::Wrapper(op.name.clone()));
+                state.needed.push(Needed::Wrapper(op.name.clone()));
                 CachetPath::from_ident(helper.ident)
             };
 
@@ -600,7 +714,7 @@ fn translate_expr_value(
                 .iter()
                 .map(|arg| {
                     Ok(Spanned::internal(Arg::Expr(translate_expr(
-                        ctx, needed, arg,
+                        ctx, state, arg,
                     )?)))
                 })
                 .collect::<Result<Vec<_>, Unhandled>>()?;
@@ -620,11 +734,11 @@ fn translate_expr_value(
                     .ok_or_else(|| Unhandled::new(format!("method `{}`", callee.name)))?;
                 // The receiver leads, then the C++ arguments.
                 let mut args = vec![Spanned::internal(Arg::Expr(translate_expr(
-                    ctx, needed, recv,
+                    ctx, state, recv,
                 )?))];
                 for arg in &call.args {
                     args.push(Spanned::internal(Arg::Expr(translate_expr(
-                        ctx, needed, arg,
+                        ctx, state, arg,
                     )?)));
                 }
                 Ok(Expr::Invoke(Call {
@@ -641,7 +755,7 @@ fn translate_expr_value(
                 // recorded for the caller to translate, and the call is emitted
                 // against its own name.
                 let target = translate_free(&callee.name).unwrap_or_else(|| {
-                    needed.push(Needed::Cpp(callee.clone()));
+                    state.needed.push(Needed::Cpp(callee.clone()));
                     CachetPath::from_ident(Ident::from(callee.name.clone()))
                 });
                 let args = call
@@ -651,7 +765,7 @@ fn translate_expr_value(
                     .filter(|arg| !is_writer_expr(arg))
                     .map(|arg| {
                         Ok(Spanned::internal(Arg::Expr(translate_expr(
-                            ctx, needed, arg,
+                            ctx, state, arg,
                         )?)))
                     })
                     .collect::<Result<Vec<_>, Unhandled>>()?;
@@ -667,7 +781,7 @@ fn translate_expr_value(
                 .ok_or_else(|| Unhandled::new(format!("unary `{}`", unary.op)))?;
             Ok(Expr::Negate(Box::new(NegateExpr {
                 kind: Spanned::internal(kind),
-                expr: Spanned::internal(translate_expr(ctx, needed, &unary.operand)?),
+                expr: Spanned::internal(translate_expr(ctx, state, &unary.operand)?),
             })))
         }
 
@@ -676,12 +790,12 @@ fn translate_expr_value(
                 .ok_or_else(|| Unhandled::new(format!("binary `{}`", binary.op)))?;
             Ok(Expr::BinOper(Box::new(BinOperExpr {
                 oper: Spanned::internal(oper),
-                lhs: Spanned::internal(translate_expr(ctx, needed, &binary.lhs)?),
-                rhs: Spanned::internal(translate_expr(ctx, needed, &binary.rhs)?),
+                lhs: Spanned::internal(translate_expr(ctx, state, &binary.lhs)?),
+                rhs: Spanned::internal(translate_expr(ctx, state, &binary.rhs)?),
             })))
         }
 
-        CppExpr::Construct(c) => translate_retype(ctx, needed, c),
+        CppExpr::Construct(c) => translate_retype(ctx, state, c),
         CppExpr::EnumConst(e) => Err(Unhandled::new(format!("enum constant `{}::{}`", e.ty, e.name))),
         // An unsuffixed C++ integer literal is an `int`, so it is `Int32` unless
         // the value doesn't fit. The subset keeps the value rather than the
@@ -707,10 +821,10 @@ fn translate_expr_value(
 /// One C++ statement can yield several, so this returns a list.
 fn translate_stmt(
     ctx: &Ctx<'_>,
-    needed: &mut Vec<Needed>,
+    state: &mut State,
     stmt: &CppSpanned<CppStmt>,
 ) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
-    translate_stmt_values(ctx, needed, stmt).map_err(|e| match e.span {
+    translate_stmt_values(ctx, state, stmt).map_err(|e| match e.span {
         CppSpan::Unknown => e.at(&stmt.span),
         _ => e,
     })
@@ -718,7 +832,7 @@ fn translate_stmt(
 
 fn translate_stmt_values(
     ctx: &Ctx<'_>,
-    needed: &mut Vec<Needed>,
+    state: &mut State,
     stmt: &CppSpanned<CppStmt>,
 ) -> Result<Vec<Spanned<Stmt>>, Unhandled> {
     match &stmt.value {
@@ -732,7 +846,7 @@ fn translate_stmt_values(
             } else {
                 ret.value
                     .as_ref()
-                    .map(|v| translate_expr(ctx, needed, v))
+                    .map(|v| translate_expr(ctx, state, v))
                     .transpose()?
             };
             Ok(vec![Spanned::internal(Stmt::Ret(RetStmt {
@@ -740,14 +854,14 @@ fn translate_stmt_values(
             }))])
         }
         CppStmt::If(s) => Ok(vec![Spanned::internal(Stmt::If(CachetIfStmt {
-            cond: Spanned::internal(translate_expr(ctx, needed, &s.cond)?),
-            then: translate_block(ctx, needed, &s.then)?,
+            cond: Spanned::internal(translate_expr(ctx, state, &s.cond)?),
+            then: translate_block(ctx, state, &s.then)?,
             // Our `els` is a block, never another `if`, so an `else if` chain
             // comes out as nested `else { if .. }`.
             else_: s
                 .els
                 .as_ref()
-                .map(|els| translate_block(ctx, needed, els).map(ElseClause::Else))
+                .map(|els| translate_block(ctx, state, els).map(ElseClause::Else))
                 .transpose()?,
         }))]),
         // Cachet's `let` always binds a value, so a C++ declaration without an
@@ -763,10 +877,13 @@ fn translate_stmt_values(
                     // Inferred, as the hand-written models leave it.
                     type_: None,
                 },
-                rhs: Spanned::internal(translate_expr(ctx, needed, init)?),
+                rhs: Spanned::internal(translate_expr(ctx, state, init)?),
             }))])
         }
-        CppStmt::Assert(_) => Err(Unhandled::new(String::from("assertion"))),
+        // An assertion states what the code believes about itself. Dropping one
+        // gives up a proof obligation, so the model is weaker than the C++ but
+        // never disagrees with it.
+        CppStmt::Assert(_) => Err(Unhandled::elided(String::from("assertion"))),
         // `writer.compareDoubleResult(..)` records a CacheIR op, which Cachet
         // spells `emit CacheIR::CompareDoubleResult(..)`. Arguments carry over
         // unchanged.
@@ -794,7 +911,7 @@ fn translate_stmt_values(
                 .iter()
                 .map(|arg| {
                     Ok(Spanned::internal(Arg::Expr(translate_expr(
-                        ctx, needed, arg,
+                        ctx, state, arg,
                     )?)))
                 })
                 .collect::<Result<Vec<_>, Unhandled>>()?;
@@ -810,6 +927,13 @@ fn translate_stmt_values(
         CppStmt::Expr(CppExpr::Call(call))
             if ctx.is_stub_generator() && is_track_attached(call) =>
         {
+            // Recorded even though nothing is emitted, so the tally of what the
+            // module leaves out stays complete.
+            state.gaps.push(Gap {
+                fidelity: Fidelity::Elided,
+                what: String::from("trackAttached"),
+                span: stmt.span.clone(),
+            });
             Ok(Vec::new())
         }
         CppStmt::Expr(_) => Err(Unhandled::new(String::from("expression statement"))),
@@ -865,16 +989,19 @@ fn unhandled_comment(e: &Unhandled, stmt: &CppSpan) -> Comment {
 /// the whole body.
 fn translate_block(
     ctx: &Ctx<'_>,
-    needed: &mut Vec<Needed>,
+    state: &mut State,
     body: &CppCompoundStmt,
 ) -> Result<Block, Unhandled> {
     let mut stmts = Vec::new();
     for stmt in &body.stmts {
-        match translate_stmt(ctx, needed, stmt) {
+        match translate_stmt(ctx, state, stmt) {
             Ok(translated) => stmts.extend(translated),
-            Err(e) => stmts.push(Spanned::internal(Stmt::from(unhandled_comment(
-                &e, &stmt.span,
-            )))),
+            Err(e) => {
+                stmts.push(Spanned::internal(Stmt::from(unhandled_comment(
+                    &e, &stmt.span,
+                ))));
+                state.gaps.push(e.into_gap(&stmt.span));
+            }
         }
     }
     Ok(Block {
@@ -906,9 +1033,9 @@ pub fn translate_fn_def(
     ops: &Ops,
     class: Option<ClassRef>,
     fn_def: &FnDef,
-) -> Result<(CallableItem, Vec<Needed>), Unhandled> {
+) -> Result<(CallableItem, State), Unhandled> {
     // A helper is top-level, so it has no parent to qualify names against.
-    // `needed` is created here and returned: its scope is this one definition.
+    // `state` is created here and returned: its scope is this one definition.
     let ctx = Ctx { class, ops };
 
     // Taking a writer is what makes a function emit, so dropping the parameter
@@ -937,8 +1064,8 @@ pub fn translate_fn_def(
     let ret =
         translate_type(&fn_def.ret).map_err(|e| Unhandled::new(format!("return type: {}", e.what)))?;
 
-    let mut needed = Vec::new();
-    let body = translate_block(&ctx, &mut needed, &fn_def.body)?;
+    let mut state = State::default();
+    let body = translate_block(&ctx, &mut state, &fn_def.body)?;
 
     let item = CallableItem {
         // Kept verbatim, as field and local names are.
@@ -950,7 +1077,7 @@ pub fn translate_fn_def(
         ret: Some(Spanned::internal(ret)),
         body: Spanned::internal(Some(body)),
     };
-    Ok((item, needed))
+    Ok((item, state))
 }
 
 /// `tryAttachNumber` becomes `TryAttachNumber`: Cachet spells ops capitalized,
@@ -967,10 +1094,10 @@ fn op_ident(method: &str) -> String {
 fn create_generator_op(
     ctx: &Ctx<'_>,
     gen_def: &MethodDef,
-) -> Result<(CallableItem, Vec<Needed>), Unhandled> {
-    let preamble = translate_preamble(&gen_def.def.params)?;
-    let mut needed = Vec::new();
-    let body = translate_block(ctx, &mut needed, &gen_def.def.body)?;
+) -> Result<(CallableItem, State), Unhandled> {
+    let preamble = translate_preamble(&gen_def.class, &gen_def.def.params)?;
+    let mut state = State::default();
+    let body = translate_block(ctx, &mut state, &gen_def.def.body)?;
 
     let item = CallableItem {
         ident: Spanned::internal(Ident::from(op_ident(&gen_def.def.name.name))),
@@ -989,7 +1116,7 @@ fn create_generator_op(
             value: Spanned::internal(None),
         })),
     };
-    Ok((item, needed))
+    Ok((item, state))
 }
 
 /// `CompareIRGenerator::tryAttachNumber` becomes
@@ -998,7 +1125,7 @@ fn create_generator_op(
 pub fn translate_gen_def(
     ops: &Ops,
     gen_def: &MethodDef,
-) -> Result<(IrItem, Vec<Needed>), Unhandled> {
+) -> Result<(IrItem, State), Unhandled> {
     // `writer` is how the C++ emits, not state the generator holds: each
     // `writer.foo(..)` becomes an `emit`, so the field itself has no
     // counterpart in the `ir` and is dropped before translating the rest.
@@ -1020,7 +1147,7 @@ pub fn translate_gen_def(
             gen_def.class
         )));
     }
-    let (op, needed) = create_generator_op(&ctx, gen_def)?;
+    let (op, state) = create_generator_op(&ctx, gen_def)?;
     let generator_op = Item::Op(op);
 
     // The `var`s first, then the single `op`, as the hand-written models order
@@ -1038,8 +1165,81 @@ pub fn translate_gen_def(
             emits: Some(Spanned::internal(CachetPath::from_ident("CacheIR"))),
             items,
         },
-        needed,
+        state,
     ))
+}
+
+/// A translated module and how far it fell short of the C++.
+pub struct Translation {
+    /// `js::jit::CompareIRGenerator::tryAttachInt32`.
+    pub unit: String,
+    pub module: Mod,
+    pub gaps: Vec<Gap>,
+}
+
+impl Translation {
+    /// Whether the module models the C++, and so may be verified.
+    ///
+    /// Elided gaps don't count: they weaken the proof without changing what the
+    /// model says. A single `Failed` gap anywhere does, including in a helper --
+    /// the generator's own body may be perfect and still call into a lie.
+    pub fn is_faithful(&self) -> bool {
+        !self.gaps.iter().any(|g| g.fidelity == Fidelity::Failed)
+    }
+
+    pub fn failures(&self) -> impl Iterator<Item = &Gap> {
+        self.gaps
+            .iter()
+            .filter(|g| g.fidelity == Fidelity::Failed)
+    }
+
+    pub fn elisions(&self) -> impl Iterator<Item = &Gap> {
+        self.gaps
+            .iter()
+            .filter(|g| g.fidelity == Fidelity::Elided)
+    }
+
+    /// One line, for a caller reporting the outcome.
+    pub fn summary(&self) -> String {
+        let elided = self.elisions().count();
+        let failed = self.failures().count();
+        if failed == 0 {
+            format!("{}: complete, {elided} elided", self.unit)
+        } else {
+            format!("{}: PARTIAL, {failed} failed, {elided} elided", self.unit)
+        }
+    }
+}
+
+/// The verdict, as a comment at the top of the module.
+///
+/// The exit status says the same thing, but it is gone as soon as the shell moves
+/// on, while the file stays on disk and will eventually be handed to the verifier
+/// by someone who didn't generate it. The file has to speak for itself.
+fn verdict_items(unit: &str, gaps: &[Gap]) -> Vec<Spanned<Item>> {
+    let failures: Vec<&Gap> = gaps
+        .iter()
+        .filter(|g| g.fidelity == Fidelity::Failed)
+        .collect();
+    let elided = gaps.len() - failures.len();
+
+    let mut text = if failures.is_empty() {
+        format!("phoenix: complete translation of {unit}.")
+    } else {
+        format!(
+            "phoenix: PARTIAL translation of {unit} -- DO NOT VERIFY.\n\
+             {} construct(s) could not be translated, so this module does not \
+             model the C++:",
+            failures.len()
+        )
+    };
+    for gap in &failures {
+        text.push_str(&format!("\n  {gap}"));
+    }
+    if elided > 0 {
+        text.push_str(&format!("\n{elided} construct(s) deliberately elided."));
+    }
+    vec![note(text)]
 }
 
 /// Extraction or translation failed.
@@ -1076,6 +1276,28 @@ impl From<Unhandled> for Error {
 /// A top-level comment, for recording what didn't translate.
 fn note(text: String) -> Spanned<Item> {
     Spanned::internal(Item::from(Comment { text }))
+}
+
+/// The models a generated module is written against: the CacheIR ops it emits,
+/// the JS value types it reasons about, and the calling-convention helpers the
+/// preamble uses.
+///
+/// `codegen.cachet` is deliberately absent -- it holds hand-written counterparts
+/// of the helpers phoenix generates -- though `js.cachet` imports it anyway.
+const IMPORTS: [&str; 3] = ["cacheir.cachet", "js.cachet", "utils.cachet"];
+
+/// Cachet resolves an import against the importing file, so the prefix depends
+/// on where the generated module is written: `..` to sit in `notes/stubs/`,
+/// something longer to sit outside the tree entirely.
+fn import_items(prefix: &Path) -> Vec<Spanned<Item>> {
+    IMPORTS
+        .iter()
+        .map(|name| {
+            Spanned::internal(Item::from(ImportItem {
+                file_path: Spanned::internal(prefix.join(name)),
+            }))
+        })
+        .collect()
 }
 
 /// A helper's C++ signature, using the types as C++ spells them.
@@ -1134,14 +1356,19 @@ fn extract_helper<'tu>(entity: &Entity<'tu>) -> Result<(Option<ClassRef>, FnDef<
     }
 }
 
-pub fn translate_generator(generator: &Entity<'_>) -> Result<Mod, Error> {
+pub fn translate_generator(
+    generator: &Entity<'_>,
+    imports: &Path,
+) -> Result<Translation, Error> {
     let ops = load_ops()?;
     let gen_def = get_method_def(generator)?;
-    let (ir, needed) = translate_gen_def(&ops, &gen_def)?;
+    let unit = format!("{}::{}", gen_def.class, gen_def.def.name.name);
+    let (ir, state) = translate_gen_def(&ops, &gen_def)?;
 
     // Each definition brings its own callees, so deeper helpers stay resolvable.
     let mut callees = gen_def.def.callees;
-    let mut queue: VecDeque<Needed> = needed.into();
+    let mut gaps = state.gaps;
+    let mut queue: VecDeque<Needed> = state.needed.into();
     // Seeded with the generator itself, so a helper that calls back into it is
     // not translated a second time.
     let mut seen: HashSet<FnId> = HashSet::from([gen_def.def.name.id]);
@@ -1162,10 +1389,16 @@ pub fn translate_generator(generator: &Entity<'_>) -> Result<Mod, Error> {
                 let op = ops.get(&op_name).expect("op resolved earlier");
                 match create_op_wrapper(op) {
                     Ok(item) => helpers.push(Spanned::internal(Item::Fn(item))),
-                    Err(e) => helpers.push(note(format!(
-                        "cannot synthesize a wrapper for `{}`: {e}",
-                        writer_method(op)
-                    ))),
+                    Err(e) => {
+                        let what =
+                            format!("no wrapper for `{}`: {}", writer_method(op), e.what);
+                        helpers.push(note(what.clone()));
+                        gaps.push(Gap {
+                            fidelity: e.fidelity,
+                            what,
+                            span: CppSpan::Unknown,
+                        });
+                    }
                 }
                 continue;
             }
@@ -1180,16 +1413,30 @@ pub fn translate_generator(generator: &Entity<'_>) -> Result<Mod, Error> {
         // the module: the generator is still worth seeing. What it leaves behind
         // is a call to a name nothing defines, which the comment accounts for.
         let Some(entity) = callees.get(&fn_ref.id).copied() else {
-            helpers.push(note(format!(
+            let what = format!(
                 "`{}` has no definition in this translation unit",
                 fn_ref.name
-            )));
+            );
+            helpers.push(note(what.clone()));
+            // A call to a name nothing defines. `cachet-compiler` would catch
+            // this one, but the verdict shouldn't depend on that.
+            gaps.push(Gap {
+                fidelity: Fidelity::Failed,
+                what,
+                span: CppSpan::Unknown,
+            });
             continue;
         };
         let (class, fn_def) = match extract_helper(&entity) {
             Ok(extracted) => extracted,
             Err(e) => {
-                helpers.push(note(format!("cannot extract `{}`: {e}", fn_ref.name)));
+                let what = format!("cannot extract `{}`: {e}", fn_ref.name);
+                helpers.push(note(what.clone()));
+                gaps.push(Gap {
+                    fidelity: Fidelity::Failed,
+                    what,
+                    span: CppSpan::Unknown,
+                });
                 continue;
             }
         };
@@ -1197,17 +1444,28 @@ pub fn translate_generator(generator: &Entity<'_>) -> Result<Mod, Error> {
             Ok((item, more)) => {
                 helpers.push(Spanned::internal(Item::Fn(item)));
                 callees.extend(fn_def.callees);
-                queue.extend(more);
+                gaps.extend(more.gaps);
+                queue.extend(more.needed);
             }
-            Err(e) => helpers.push(note(format!(
-                "cannot translate:\n{}\n{e}",
-                cpp_signature(&fn_def)
-            ))),
+            Err(e) => {
+                helpers.push(note(format!(
+                    "cannot translate:\n{}\n{e}",
+                    cpp_signature(&fn_def)
+                )));
+                gaps.push(Gap {
+                    fidelity: e.fidelity,
+                    what: format!("cannot translate `{}`: {}", fn_def.name.name, e.what),
+                    span: e.span,
+                });
+            }
         }
     }
 
-    Ok(helpers
+    let module = verdict_items(&unit, &gaps)
         .into_iter()
+        .chain(import_items(imports))
+        .chain(helpers)
         .chain([Spanned::internal(Item::Ir(ir))])
-        .collect())
+        .collect();
+    Ok(Translation { unit, module, gaps })
 }

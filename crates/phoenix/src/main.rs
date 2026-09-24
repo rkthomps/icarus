@@ -236,6 +236,11 @@ enum Cmd {
         /// Write here instead of standard output.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Directory the generated `import`s point at, relative to where the
+        /// module is written. The default suits `notes/stubs/`; output kept
+        /// elsewhere needs its own, e.g. `../../notes`.
+        #[arg(long, default_value = "..")]
+        imports: PathBuf,
     },
     /// Dump the generator lowered into the modeled C++ subset.
     Subset { symbol: String },
@@ -300,11 +305,11 @@ fn main() {
     };
 
     match &opt.cmd {
-        Cmd::Cachet { out, .. } => {
+        Cmd::Cachet { out, imports, .. } => {
             // A method is a stub generator, which becomes an `ir`; a free
             // function is a helper, which becomes a `fn`.
-            let extracted = if def.get_kind() == EntityKind::FunctionDecl {
-                phoenix::cpp_to_cachet::load_ops()
+            if def.get_kind() == EntityKind::FunctionDecl {
+                let translated = phoenix::cpp_to_cachet::load_ops()
                     .map_err(|e| e.to_string())
                     .and_then(|ops| {
                         let f =
@@ -312,23 +317,39 @@ fn main() {
                         // A free function: no class, so nothing is ambient.
                         phoenix::cpp_to_cachet::translate_fn_def(&ops, None, &f)
                             .map_err(|e| e.to_string())
-                    })
-                    // TODO: `needed` names the helpers this one calls; the
-                    // worklist that translates them isn't wired up yet.
-                    .map(|(callable, _needed)| {
-                        cachet_lang::parser::Item::Fn(callable).to_string()
-                    })
+                    });
+                match translated {
+                    // TODO: `state.needed` names the helpers this one calls; the
+                    // worklist that translates them isn't wired up here.
+                    Ok((callable, state)) => {
+                        let item = cachet_lang::parser::Item::Fn(callable);
+                        write_out(out.as_deref(), &format!("{item}\n"));
+                        report_gaps(symbol, &state.gaps);
+                    }
+                    Err(e) => {
+                        eprintln!("cannot translate {symbol}: {e}");
+                        std::process::exit(1);
+                    }
+                }
             } else {
                 // The generator plus every helper it calls.
-                phoenix::cpp_to_cachet::translate_generator(&def)
-                    .map_err(|e| e.to_string())
-                    .map(|module| module.to_string())
-            };
-            match extracted {
-                Ok(ir) => write_out(out.as_deref(), &format!("{ir}\n")),
-                Err(e) => {
-                    eprintln!("cannot translate {symbol}: {e}");
-                    std::process::exit(1);
+                match phoenix::cpp_to_cachet::translate_generator(&def, imports) {
+                    Ok(translation) => {
+                        write_out(out.as_deref(), &format!("{}\n", translation.module));
+                        // Nonzero on a partial translation, so a shell chain
+                        // can't go on to compile and verify one by accident.
+                        eprintln!("{}", translation.summary());
+                        if !translation.is_faithful() {
+                            for gap in translation.failures() {
+                                eprintln!("  failed: {gap}");
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("cannot translate {symbol}: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -368,6 +389,25 @@ fn print_location(def: &Entity, symbol: &str, source: &Path) {
         let l = loc.get_file_location();
         println!("// {symbol} at {}:{}", source.display(), l.line);
     }
+}
+
+/// The verdict for a single `fn`, which has no module header to carry it.
+fn report_gaps(symbol: &str, gaps: &[phoenix::cpp_to_cachet::Gap]) {
+    use phoenix::cpp_to_cachet::Fidelity;
+    let failed: Vec<_> = gaps
+        .iter()
+        .filter(|g| g.fidelity == Fidelity::Failed)
+        .collect();
+    let elided = gaps.len() - failed.len();
+    if failed.is_empty() {
+        eprintln!("{symbol}: complete, {elided} elided");
+        return;
+    }
+    eprintln!("{symbol}: PARTIAL, {} failed, {elided} elided", failed.len());
+    for gap in failed {
+        eprintln!("  failed: {gap}");
+    }
+    std::process::exit(1);
 }
 
 fn write_out(out: Option<&Path>, text: &str) {

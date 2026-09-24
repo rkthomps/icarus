@@ -67,7 +67,8 @@ cargo run -p phoenix -- calls 'SetPropIRGenerator::tryAttachNativeSetSlot' --dep
 ```
 
 `cachet` dispatches on the symbol: a generator method becomes an `ir`, a free
-function becomes a `fn`.
+function becomes a `fn`. Its `--imports` is where the generated `import`s point,
+relative to `--out`; the default suits `notes/stubs/`.
 
 `--source` and `--db` are global and may go before or after the subcommand.
 `--source` is matched as a path suffix against the compile database, and
@@ -84,6 +85,28 @@ cargo run -p phoenix -- ast 'CompareIRGenerator::tryAttachNumber' \
 
 `cargo run -p phoenix -- help` lists the subcommands; `help <subcommand>` shows
 one in detail.
+
+## Profile
+
+`scripts/translate-verify.sh` translates, compiles and verifies, one line per
+stub as it finishes. A bare class name means every `tryAttach*` on it, so one
+run says how much translates and how much of that verifies.
+
+```sh
+# the whole class
+./scripts/translate-verify.sh CompareIRGenerator
+
+# one stub
+./scripts/translate-verify.sh 'CompareIRGenerator::tryAttachInt32'
+
+# ...with the compiler and verifier output as it goes
+./scripts/translate-verify.sh -v 'CompareIRGenerator::tryAttachNumber'
+```
+
+Output lands in `out/phoenix/`, which is gitignored: a partial translation is an
+artifact, not source. `PASS` means verified; `PARTIAL` means phoenix marked the
+module `DO NOT VERIFY` and it was not compiled; `TRANSLATE`, `COMPILE` and
+`VERIFY` name the stage that failed. Exits 1 unless everything passed.
 
 phoenix loads libclang at run time from `~/.mozbuild/clang`, so the parser and
 the compile flags come from the same toolchain. `PHOENIX_CLANG_ARGS` appends
