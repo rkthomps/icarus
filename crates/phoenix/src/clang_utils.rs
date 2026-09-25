@@ -95,14 +95,30 @@ pub fn qualified_name(e: Entity) -> String {
     }
 }
 
+/// The file a definition was written in, if it has one.
+fn file_of(e: Entity) -> Option<PathBuf> {
+    Some(e.get_location()?.get_file_location().file?.get_path())
+}
+
 /// Walk top-level declarations (including those nested in namespaces and
 /// classes) looking for the method *definition* whose qualified name matches.
 ///
 /// Classes are descended into because a method can be defined inside its class
 /// rather than out of line: every `CacheIRWriter` method is, so without this the
 /// whole header is invisible.
-pub fn find_definition<'tu>(root: Entity<'tu>, qualified: &str) -> Option<Entity<'tu>> {
-    let mut found = None;
+///
+/// A name can have several definitions: `CacheIRCompiler::emitGuardIsNull` is
+/// both the real one in `CacheIRCompiler.cpp` and the generated shim taking a
+/// `CacheIRReader` that decodes the operands and calls it. So a definition in
+/// `source` wins, that being the file the caller asked about; anything else is a
+/// fallback for when the symbol lives somewhere unexpected.
+pub fn find_definition<'tu>(
+    root: Entity<'tu>,
+    qualified: &str,
+    source: &Path,
+) -> Option<Entity<'tu>> {
+    let mut preferred = None;
+    let mut fallback = None;
     root.visit_children(|e, _| {
         use clang::EntityVisitResult::*;
         match e.get_kind() {
@@ -111,15 +127,18 @@ pub fn find_definition<'tu>(root: Entity<'tu>, qualified: &str) -> Option<Entity
             }
             EntityKind::Method | EntityKind::FunctionDecl if e.is_definition() => {
                 if qualified_name(e) == qualified {
-                    found = Some(e);
-                    return Break;
+                    if file_of(e).is_some_and(|path| path.ends_with(source)) {
+                        preferred = Some(e);
+                        return Break;
+                    }
+                    fallback.get_or_insert(e);
                 }
             }
             _ => {}
         }
         Continue
     });
-    found
+    preferred.or(fallback)
 }
 
 // TODO: Fail gracefully

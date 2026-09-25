@@ -19,7 +19,7 @@ use crate::cacheir_ops::{
     writer_method,
 };
 use crate::cpp_subset::{
-    Call as CppCall, Callee as CppCallee, CompoundStmt as CppCompoundStmt,
+    Call as CppCall, Callee as CppCallee, Callees, CompoundStmt as CppCompoundStmt,
     Construct as CppConstruct, Expr as CppExpr, FnDef, Indirection, Lit as CppLit,
     Error as SubsetError, FnId, FnRef, Param, RefKind, Span as CppSpan, Spanned as CppSpanned,
     Stmt as CppStmt, Type as CppType, get_fn_def, walk_block,
@@ -517,20 +517,59 @@ impl Ctx<'_> {
 ///
 /// The names do not always match, which is why this is a table and not a rule:
 /// C++ spells it `isBoolean`, the model spells it `isBool`.
-fn translate_method(recv_ty: CachetPath, method: &str) -> Option<CachetPath> {
-    let value = CachetPath::from_ident("Value");
-    let name = match (recv_ty, method) {
-        // `impl Value` in notes/js.cachet.
-        (ty, "isNumber") if ty == value => "isNumber",
-        (ty, "isInt32") if ty == value => "isInt32",
-        (ty, "isBoolean") if ty == value => "isBool",
-        (ty, "isNull") if ty == value => "isNull",
-        (ty, "isNullOrUndefined") if ty == value => "isNullOrUndefined",
-        _ => return None,
-    };
-    // `impl Value { fn isNumber(value: Value) }` is called as
-    // `Value::isNumber(v)`, so the C++ receiver becomes the first argument.
-    Some(recv_ty.nest(Ident::from(name)))
+fn translate_method(recv: &CppType, method: &str) -> Option<(&'static str, &'static str)> {
+    let cpp_ty = recv.scope.join("::");
+    let cachet_ty = translate_type(recv).ok().map(|ty| ty.to_string());
+
+    match (cpp_ty.as_str(), cachet_ty.as_deref(), method) {
+        // Keyed on the Cachet type, so `lhsVal_.isNumber()` (whose receiver is a
+        // `JS::Handle<JS::Value>`) and `v.isNumber()` (a `const JS::Value&`)
+        // reach one entry rather than one per wrapper. `impl Value` in
+        // notes/js.cachet.
+        (_, Some("Value"), "isNumber") => Some(("Value", "isNumber")),
+        (_, Some("Value"), "isInt32") => Some(("Value", "isInt32")),
+        (_, Some("Value"), "isBoolean") => Some(("Value", "isBool")),
+        (_, Some("Value"), "isNull") => Some(("Value", "isNull")),
+        (_, Some("Value"), "isNullOrUndefined") => Some(("Value", "isNullOrUndefined")),
+
+        // Keyed on the C++ type, there being no Cachet type: an instruction
+        // reaches registers *through* `allocator`, which the model holds no
+        // value for, keeping those operations on `ir CacheIR` instead.
+        ("js::jit::CacheRegisterAllocator", _, "knownType") => Some(("CacheIR", "knownType")),
+
+        _ => None,
+    }
+}
+
+/// A C++ enum constant to the Cachet one, as
+/// `(cpp type, cpp const) -> (cachet type, cachet const)`.
+///
+/// A table rather than a rule: the model spells the value types as
+/// `JS::ValueType` does (Value.h:176), while the code being translated uses the
+/// older `JSVAL_TYPE_*` constants, and stripping the prefix isn't enough --
+/// `BOOLEAN` is `Bool` and `PRIVATE_GCTHING` is `PrivateGCThing`. Other enums
+/// don't even agree on the type's name.
+fn translate_enum_const(ty: &str, name: &str) -> Option<(&'static str, &'static str)> {
+    match (ty, name) {
+        // `enum JSValueType` (notes/js.cachet:349) against Value.h:158. The two
+        // agree variant for variant, in the same order.
+        ("JSValueType", "JSVAL_TYPE_DOUBLE") => Some(("JSValueType", "Double")),
+        ("JSValueType", "JSVAL_TYPE_INT32") => Some(("JSValueType", "Int32")),
+        ("JSValueType", "JSVAL_TYPE_BOOLEAN") => Some(("JSValueType", "Bool")),
+        ("JSValueType", "JSVAL_TYPE_UNDEFINED") => Some(("JSValueType", "Undefined")),
+        ("JSValueType", "JSVAL_TYPE_NULL") => Some(("JSValueType", "Null")),
+        ("JSValueType", "JSVAL_TYPE_MAGIC") => Some(("JSValueType", "Magic")),
+        ("JSValueType", "JSVAL_TYPE_STRING") => Some(("JSValueType", "String")),
+        ("JSValueType", "JSVAL_TYPE_SYMBOL") => Some(("JSValueType", "Symbol")),
+        ("JSValueType", "JSVAL_TYPE_PRIVATE_GCTHING") => {
+            Some(("JSValueType", "PrivateGCThing"))
+        }
+        ("JSValueType", "JSVAL_TYPE_BIGINT") => Some(("JSValueType", "BigInt")),
+        ("JSValueType", "JSVAL_TYPE_OBJECT") => Some(("JSValueType", "Object")),
+        ("JSValueType", "JSVAL_TYPE_UNKNOWN") => Some(("JSValueType", "Unknown")),
+
+        _ => None,
+    }
 }
 
 /// A C++ free function to the Cachet function that models it.
@@ -631,6 +670,23 @@ fn is_track_attached(call: &CppCall) -> bool {
     )
 }
 
+/// A call that records nothing about the machine, and so is dropped rather than
+/// translated. The name is for the tally; `None` means keep translating.
+///
+/// Both of these feed the IC spewer, which is a debugging aid: `JitSpew` has no
+/// effect outside a `JS_JITSPEW` build at all (JitSpewer.h:41 -- "None of the
+/// global functions have effect on non-debug builds"), and `trackAttached` sets
+/// a stub name for it to print. Neither emits CacheIR.
+fn dropped_call(ctx: &Ctx<'_>, call: &CppCall) -> Option<&'static str> {
+    if matches!(&call.callee, CppCallee::Free(callee) if callee.name == "JitSpew") {
+        return Some("JitSpew");
+    }
+    if ctx.is_stub_generator() && is_track_attached(call) {
+        return Some("trackAttached");
+    }
+    None
+}
+
 /// The declared type of whatever an expression names.
 ///
 /// Needed to key [`translate_method`]: only a name carries a type in the
@@ -729,13 +785,24 @@ fn translate_expr_value(
                 recv: Some(recv),
                 callee,
             } => {
-                let recv_ty = translate_type(named_type(recv)?)?;
-                let target = translate_method(recv_ty, &callee.name)
-                    .ok_or_else(|| Unhandled::new(format!("method `{}`", callee.name)))?;
-                // The receiver leads, then the C++ arguments.
-                let mut args = vec![Spanned::internal(Arg::Expr(translate_expr(
-                    ctx, state, recv,
-                )?))];
+                let recv_ty = named_type(recv)?;
+                let (ty, name) = translate_method(recv_ty, &callee.name).ok_or_else(|| {
+                    Unhandled::new(format!(
+                        "method `{}` on `{}`",
+                        callee.name, recv_ty.spelled
+                    ))
+                })?;
+                let target = CachetPath::from_ident(ty).nest(Ident::from(name));
+
+                // A value receiver leads, as `impl Value { fn isNumber(value:
+                // Value) }` takes its subject as the first argument. An ambient
+                // one is no value at all, so there is nothing to pass.
+                let mut args = Vec::new();
+                if translate_type(recv_ty).is_ok() {
+                    args.push(Spanned::internal(Arg::Expr(translate_expr(
+                        ctx, state, recv,
+                    )?)));
+                }
                 for arg in &call.args {
                     args.push(Spanned::internal(Arg::Expr(translate_expr(
                         ctx, state, arg,
@@ -796,7 +863,13 @@ fn translate_expr_value(
         }
 
         CppExpr::Construct(c) => translate_retype(ctx, state, c),
-        CppExpr::EnumConst(e) => Err(Unhandled::new(format!("enum constant `{}::{}`", e.ty, e.name))),
+        CppExpr::EnumConst(e) => {
+            let (ty, name) = translate_enum_const(&e.ty, &e.name)
+                .ok_or_else(|| Unhandled::new(format!("enum constant `{}::{}`", e.ty, e.name)))?;
+            Ok(Expr::Var(Spanned::internal(
+                CachetPath::from_ident(ty).nest(Ident::from(name)),
+            )))
+        }
         // An unsuffixed C++ integer literal is an `int`, so it is `Int32` unless
         // the value doesn't fit. The subset keeps the value rather than the
         // spelling, so a suffix in the source isn't recoverable here; a literal
@@ -920,18 +993,12 @@ fn translate_stmt_values(
                 args: Spanned::internal(args),
             }))])
         }
-        // `trackAttached("Compare.Int32")` records which stub was attached, for
-        // the IC spewer: it sets `stubName_` and, under `JS_CACHEIR_SPEW`, logs
-        // the operands (CacheIR.cpp:15353). No CacheIR is emitted and the stub
-        // is unaffected, so it is dropped rather than translated.
-        CppStmt::Expr(CppExpr::Call(call))
-            if ctx.is_stub_generator() && is_track_attached(call) =>
-        {
+        CppStmt::Expr(CppExpr::Call(call)) if dropped_call(ctx, call).is_some() => {
             // Recorded even though nothing is emitted, so the tally of what the
             // module leaves out stays complete.
             state.gaps.push(Gap {
                 fidelity: Fidelity::Elided,
-                what: String::from("trackAttached"),
+                what: String::from(dropped_call(ctx, call).unwrap()),
                 span: stmt.span.clone(),
             });
             Ok(Vec::new())
@@ -1356,22 +1423,25 @@ fn extract_helper<'tu>(entity: &Entity<'tu>) -> Result<(Option<ClassRef>, FnDef<
     }
 }
 
-pub fn translate_generator(
-    generator: &Entity<'_>,
-    imports: &Path,
-) -> Result<Translation, Error> {
-    let ops = load_ops()?;
-    let gen_def = get_method_def(generator)?;
-    let unit = format!("{}::{}", gen_def.class, gen_def.def.name.name);
-    let (ir, state) = translate_gen_def(&ops, &gen_def)?;
-
-    // Each definition brings its own callees, so deeper helpers stay resolvable.
-    let mut callees = gen_def.def.callees;
-    let mut gaps = state.gaps;
-    let mut queue: VecDeque<Needed> = state.needed.into();
-    // Seeded with the generator itself, so a helper that calls back into it is
-    // not translated a second time.
-    let mut seen: HashSet<FnId> = HashSet::from([gen_def.def.name.id]);
+/// Everything a translated definition referred to, and everything those refer to
+/// in turn.
+///
+/// `seed` is what the entry definition produced -- the names it needs, and the
+/// gaps it already has -- and `seen` the ids already translated, so a callee that
+/// reaches back into one of them isn't translated twice.
+///
+/// Nothing here is fatal. A callee that can't be extracted or translated becomes
+/// a note and a `Failed` gap, so the rest of the module still comes out; what it
+/// leaves behind is a call to a name nothing defines, which the note accounts
+/// for.
+fn translate_transitive_callees<'tu>(
+    ops: &Ops,
+    mut callees: Callees<'tu>,
+    seed: State,
+    mut seen: HashSet<FnId>,
+) -> (Vec<Spanned<Item>>, Vec<Gap>) {
+    let mut gaps = seed.gaps;
+    let mut queue: VecDeque<Needed> = seed.needed.into();
     // Wrappers are identified by op name rather than by a C++ symbol, since
     // there is no C++ definition behind them.
     let mut wrapped: HashSet<String> = HashSet::new();
@@ -1460,6 +1530,44 @@ pub fn translate_generator(
             }
         }
     }
+
+    (helpers, gaps)
+}
+
+/// A definition and everything it calls, with the definition last, as the
+/// helpers it depends on have to be defined before it reads.
+pub fn translate_fn_and_transitive_callees<'tu>(
+    ops: &Ops,
+    class: Option<ClassRef>,
+    fn_def: FnDef<'tu>,
+) -> Result<(Vec<Spanned<Item>>, Vec<Gap>), Unhandled> {
+    // Seeded with the definition itself, so one that reaches back into itself
+    // isn't translated a second time.
+    let seen = HashSet::from([fn_def.name.id.clone()]);
+    let (item, state) = translate_fn_def(ops, class, &fn_def)?;
+    let (mut items, gaps) = translate_transitive_callees(ops, fn_def.callees, state, seen);
+    items.push(Spanned::internal(Item::Fn(item)));
+    Ok((items, gaps))
+}
+
+pub fn translate_generator(
+    generator: &Entity<'_>,
+    imports: &Path,
+) -> Result<Translation, Error> {
+    let ops = load_ops()?;
+    let gen_def = get_method_def(generator)?;
+    let unit = format!("{}::{}", gen_def.class, gen_def.def.name.name);
+    let (ir, state) = translate_gen_def(&ops, &gen_def)?;
+
+    // Each definition brings its own callees, so deeper helpers stay resolvable.
+    // Seeded with the generator itself, so a helper that calls back into it is
+    // not translated a second time.
+    let (helpers, gaps) = translate_transitive_callees(
+        &ops,
+        gen_def.def.callees,
+        state,
+        HashSet::from([gen_def.def.name.id]),
+    );
 
     let module = verdict_items(&unit, &gaps)
         .into_iter()

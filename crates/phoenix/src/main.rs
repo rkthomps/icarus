@@ -21,7 +21,7 @@
 //! the same self-consistent toolchain. Set `LIBCLANG_PATH` to override.
 
 use clang::{Clang, Entity, EntityKind, Index};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use phoenix::clang_utils::{find_definition, get_errors, parse_file, qualified_name};
 use std::path::{Path, PathBuf};
 
@@ -227,12 +227,33 @@ struct Opt {
     cmd: Cmd,
 }
 
+/// What kind of C++ a symbol is, and so which Cachet item it becomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Unit {
+    /// A `*IRGenerator::tryAttach*` method, which becomes an `ir` holding one
+    /// `op`, plus every helper it calls.
+    Generator,
+    /// A free function the generators call, which becomes a top-level `fn`,
+    /// plus every helper it calls.
+    Function,
+    /// A method translated as a top-level `fn`, its class deciding what is
+    /// ambient -- a `CacheIRWriter` wrapper being the case that works today.
+    Method,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Translate to Cachet.
     Cachet {
         /// `Class::method`, or a bare function name.
         symbol: String,
+        /// What the symbol is, which decides what it becomes.
+        ///
+        /// Stated rather than sniffed: the entity kind distinguishes a method
+        /// from a function, but a stub generator and an instruction are both
+        /// methods and become different things.
+        #[arg(long, value_enum, default_value_t = Unit::Generator)]
+        unit: Unit,
         /// Write here instead of standard output.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -299,32 +320,47 @@ fn main() {
         );
     }
 
-    let Some(def) = find_definition(tu.get_entity(), symbol) else {
+    let Some(def) = find_definition(tu.get_entity(), symbol, &opt.source) else {
         eprintln!("definition of {symbol} not found");
         std::process::exit(1);
     };
 
     match &opt.cmd {
-        Cmd::Cachet { out, imports, .. } => {
-            // A method is a stub generator, which becomes an `ir`; a free
-            // function is a helper, which becomes a `fn`.
-            if def.get_kind() == EntityKind::FunctionDecl {
+        Cmd::Cachet {
+            out,
+            imports,
+            unit,
+            ..
+        } => {
+            if *unit != Unit::Generator {
+                // A free function has no class, so nothing is ambient; a method
+                // carries its class, which decides what is.
                 let translated = phoenix::cpp_to_cachet::load_ops()
                     .map_err(|e| e.to_string())
                     .and_then(|ops| {
-                        let f =
-                            phoenix::cpp_subset::get_fn_def(&def).map_err(|e| e.to_string())?;
-                        // A free function: no class, so nothing is ambient.
-                        phoenix::cpp_to_cachet::translate_fn_def(&ops, None, &f)
-                            .map_err(|e| e.to_string())
+                        let (class, fn_def) = match unit {
+                            Unit::Function => {
+                                (None, phoenix::cpp_subset::get_fn_def(&def).map_err(|e| e.to_string())?)
+                            }
+                            _ => {
+                                let m = phoenix::cpp_subset::get_method_def(&def)
+                                    .map_err(|e| e.to_string())?;
+                                (Some(m.class), m.def)
+                            }
+                        };
+                        phoenix::cpp_to_cachet::translate_fn_and_transitive_callees(
+                            &ops, class, fn_def,
+                        )
+                        .map_err(|e| e.to_string())
                     });
                 match translated {
-                    // TODO: `state.needed` names the helpers this one calls; the
-                    // worklist that translates them isn't wired up here.
-                    Ok((callable, state)) => {
-                        let item = cachet_lang::parser::Item::Fn(callable);
-                        write_out(out.as_deref(), &format!("{item}\n"));
-                        report_gaps(symbol, &state.gaps);
+                    Ok((items, gaps)) => {
+                        let text: String = items
+                            .iter()
+                            .map(|item| format!("{}\n", item.value))
+                            .collect();
+                        write_out(out.as_deref(), &text);
+                        report_gaps(symbol, &gaps);
                     }
                     Err(e) => {
                         eprintln!("cannot translate {symbol}: {e}");
