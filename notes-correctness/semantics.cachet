@@ -1,0 +1,142 @@
+// Reference semantics for the JS operations that inline caches specialize.
+//
+// Icarus's existing model says what a stub *does*. This file says what the
+// bytecode *means*, so the two can be compared. It is modeled from the C++
+// interpreter, which is ground truth -- each fn names the function and line it
+// was taken from.
+//
+// Modeling strategy: each fn is *definitionally complete on the cases a stub's
+// guards can admit*, and bottoms out in an uninterpreted `...Slow` helper
+// everywhere else. A guarded path reduces concretely; an unguarded one reaches
+// an opaque function and proves nothing. That keeps these specs small without
+// letting the verifier conclude anything false.
+//
+// Cachet has no recursion, so the recursive steps of the spec algorithms are
+// unrolled by hand where a guarded path needs them, and punted otherwise.
+
+import "../notes/js.cachet";
+import "../notes/jsop.cachet";
+
+impl Value {
+    // Number conversion for the primitives a comparison stub can see.
+    // ToNumber, with null -> +0 and false/true -> 0/1. Int32 domain only:
+    // the stubs we are specifying have already guarded the operands into
+    // int32 range, so a wider numeric tower is not needed here.
+    fn toInt32ForToNumber(value: Value) -> Int32 {
+        if Value::isInt32(value) {
+            return Value::toInt32(value);
+        }
+        if Value::isNull(value) {
+            return 0_i32;
+        }
+        assert Value::isBool(value);
+        if Value::toBool(value) {
+            return 1_i32;
+        }
+        return 0_i32;
+    }
+
+    // js::StrictlyEqual, vm/EqualityOperations.cpp. Specified on the
+    // primitives reachable through CanConvertToInt32ForToNumber; anything
+    // else is opaque.
+    fn strictlyEqual(lhs: Value, rhs: Value) -> Bool {
+        if Value::isInt32(lhs) && Value::isInt32(rhs) {
+            return Value::toInt32(lhs) == Value::toInt32(rhs);
+        }
+        if Value::isBool(lhs) && Value::isBool(rhs) {
+            return Value::toBool(lhs) == Value::toBool(rhs);
+        }
+        if Value::isNull(lhs) && Value::isNull(rhs) {
+            return true;
+        }
+        // Any remaining pair drawn from {Int32, Bool, Null} has two different
+        // types, and differently-typed values are never strictly equal. (The
+        // Int32/Double exception does not arise: this slice has no Doubles.)
+        if (Value::isInt32(lhs) || Value::isBool(lhs) || Value::isNull(lhs))
+            && (Value::isInt32(rhs) || Value::isBool(rhs) || Value::isNull(rhs)) {
+            return false;
+        }
+        unsafe { Value::strictlyEqualSlow(lhs, rhs) }
+    }
+
+    unsafe fn strictlyEqualSlow(lhs: Value, rhs: Value) -> Bool;
+
+    // js::LooselyEqual, vm/EqualityOperations.cpp:83.
+    //
+    // The step numbers are the spec's (Abstract Equality Comparison).
+    // NOTE the asymmetry that makes this interesting: step 2 says null is
+    // loosely equal only to null and undefined -- `null == 0` is FALSE --
+    // whereas step 9 says a boolean converts to a number first, so
+    // `true == 1` is TRUE. A stub that converts both operands to int32 gets
+    // the boolean case right and the null case wrong.
+    fn looselyEqual(lhs: Value, rhs: Value) -> Bool {
+        // Step 1: same type -> strict equality.
+        if Value::isInt32(lhs) && Value::isInt32(rhs) {
+            return Value::toInt32(lhs) == Value::toInt32(rhs);
+        }
+        if Value::isBool(lhs) && Value::isBool(rhs) {
+            return Value::toBool(lhs) == Value::toBool(rhs);
+        }
+
+        // Steps 2-4: null/undefined compare equal to each other and to
+        // nothing else (ignoring [[IsHTMLDDA]], which needs an Object).
+        if Value::isNullOrUndefined(lhs) {
+            return Value::isNullOrUndefined(rhs);
+        }
+        if Value::isNullOrUndefined(rhs) {
+            return false;
+        }
+
+        // Steps 9-10: a boolean is converted with ToNumber, then compared.
+        // Unrolled one level rather than recursing, for the int32 case.
+        if Value::isBool(lhs) && Value::isInt32(rhs) {
+            return Value::toInt32ForToNumber(lhs) == Value::toInt32(rhs);
+        }
+        if Value::isInt32(lhs) && Value::isBool(rhs) {
+            return Value::toInt32(lhs) == Value::toInt32ForToNumber(rhs);
+        }
+
+        // Doubles, strings, BigInts, Symbols, objects (ToPrimitive).
+        unsafe { Value::looselyEqualSlow(lhs, rhs) }
+    }
+
+    unsafe fn looselyEqualSlow(lhs: Value, rhs: Value) -> Bool;
+
+    // Abstract Relational Comparison, for the int32-convertible primitives.
+    // Unlike equality, relational ops convert null and booleans via ToNumber,
+    // so null behaves as 0 here.
+    fn relational(jsop: JSOp, lhs: Value, rhs: Value) -> Bool {
+        let l = Value::toInt32ForToNumber(lhs);
+        let r = Value::toInt32ForToNumber(rhs);
+        if jsop == JSOp::Lt {
+            return l < r;
+        }
+        if jsop == JSOp::Le {
+            return l <= r;
+        }
+        if jsop == JSOp::Gt {
+            return l > r;
+        }
+        assert jsop == JSOp::Ge;
+        return l >= r;
+    }
+}
+
+// The result JSOp::Eq/Ne/StrictEq/StrictNe/Lt/Le/Gt/Ge pushes, given the two
+// values the interpreter would have popped. This is the postcondition a
+// Compare stub must satisfy.
+fn compareResult(jsop: JSOp, lhs: Value, rhs: Value) -> Bool {
+    if jsop == JSOp::Eq {
+        return Value::looselyEqual(lhs, rhs);
+    }
+    if jsop == JSOp::Ne {
+        return !Value::looselyEqual(lhs, rhs);
+    }
+    if jsop == JSOp::StrictEq {
+        return Value::strictlyEqual(lhs, rhs);
+    }
+    if jsop == JSOp::StrictNe {
+        return !Value::strictlyEqual(lhs, rhs);
+    }
+    return Value::relational(jsop, lhs, rhs);
+}

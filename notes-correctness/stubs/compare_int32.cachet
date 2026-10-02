@@ -1,0 +1,72 @@
+// Functional spec for CompareIRGenerator::tryAttachInt32.
+//
+// notes/stubs/compare_int32.cachet proves this stub is *safe*. This proves it
+// is *right*: the Value left in the output register is the one the baseline
+// interpreter would have pushed.
+//
+// The link between the two levels is:
+//   - getOperandLocation(id) + MASM::getValue  -- the Value behind an OperandId
+//   - AssertEqValueOutput                      -- the Value in the output reg
+// Both are evaluated by the interpreter phase, so the comparison happens at
+// the right point in time even though the expected value is computed during
+// the generator phase.
+
+import "../../notes/cacheir.cachet";
+import "../../notes/utils.cachet";
+import "../../notes/codegen.cachet";
+import "../semantics.cachet";
+
+ir CacheStub emits CacheIR {
+    op CompareInt32(
+        lhsId: ValueId,
+        rhsId: ValueId,
+        jsop: JSOp,
+    ) {
+        initRegState();
+
+        initOperandId(lhsId);
+        initInputValueId(lhsId);
+        let lhsValue = MASM::getValue(
+            OperandLocation::getValueReg(CacheIR::getOperandLocation(lhsId)));
+
+        initOperandId(rhsId);
+        initInputValueId(rhsId);
+        let rhsValue = MASM::getValue(
+            OperandLocation::getValueReg(CacheIR::getOperandLocation(rhsId)));
+
+        initValueOutput();
+
+        assume JSOp::isEqualityOp(jsop) || JSOp::isRelationalOp(jsop);
+
+        // CanConvertToInt32ForToNumber(lhsVal_) && ...(rhsVal_), the guard the
+        // generator checks before attaching at all.
+        assume Value::isInt32(lhsValue) || Value::isBool(lhsValue) || Value::isNull(lhsValue);
+        assume Value::isInt32(rhsValue) || Value::isBool(rhsValue) || Value::isNull(rhsValue);
+
+        // MOZ_ASSERT_IF(lhsVal_.isNull() || rhsVal_.isNull(), !IsEqualityOp(op_));
+        // "Should have been handled by tryAttachAnyNullUndefined."
+        // Dropping this is sound for safety and UNSOUND for correctness:
+        // without it, `null == 0` is a counterexample.
+        assume !(Value::isNull(lhsValue) || Value::isNull(rhsValue))
+            || !JSOp::isEqualityOp(jsop);
+
+        // MOZ_ASSERT_IF(op_ == JSOp::StrictEq || op_ == JSOp::StrictNe,
+        //               lhsVal_.type() == rhsVal_.type());
+        // "Strictly different types should have been handed by
+        // tryAttachStrictDifferentTypes."
+        // Also sound to drop for safety, also unsound for correctness:
+        // without it, `true === 1` is a counterexample.
+        assume !JSOp::isStrictEqualityOp(jsop)
+            || Value::isSameType(lhsValue, rhsValue);
+
+        // EmitGuardToInt32ForToNumber, twice, then the compare. This is the
+        // stub the generator actually emits.
+        let lhsInt32Id = emitGuardToInt32ForToNumber(lhsId, lhsValue);
+        let rhsInt32Id = emitGuardToInt32ForToNumber(rhsId, rhsValue);
+        emit CacheIR::CompareInt32Result(jsop, lhsInt32Id, rhsInt32Id);
+
+        // The functional postcondition.
+        emit CacheIR::AssertEqValueOutput(
+            Value::fromBool(compareResult(jsop, lhsValue, rhsValue)));
+    }
+}
